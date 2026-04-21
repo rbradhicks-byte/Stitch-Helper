@@ -1,0 +1,10 @@
+bin/
+obj/
+dist/
+smoke/
+.vs/
+tmp_corehost_trace.txt
+*.user
+*.suo
+*.cache
+TestResults/

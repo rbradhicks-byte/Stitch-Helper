@@ -1,0 +1,27 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\CwsEditor.Core\CwsEditor.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Remove="Assets\StitchHelper.ico" />
+    <Resource Include="Assets\StitchHelper.ico" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <AssemblyName>Stitch Helper</AssemblyName>
+    <ApplicationIcon>Assets\StitchHelper.ico</ApplicationIcon>
+    <Product>Stitch Helper</Product>
+  </PropertyGroup>
+
+</Project>
