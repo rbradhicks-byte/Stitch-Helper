@@ -3,6 +3,7 @@ using System.IO;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using CwsEditor.Core;
@@ -15,15 +16,21 @@ public partial class MainWindow : Window
 {
     private const string DefaultSelectionText = "Shift+drag in the overview or main viewer to select a depth interval. Drag the yellow box to move the current viewport.";
     private const string DefaultHoverText = "Depth / wrap angle / file orientation";
+    private const double ViewerRenderMinimumBufferDisplayPixels = 220d;
+    private const double ViewerRenderDebounceMilliseconds = 120d;
 
     private readonly EditSession _session = new();
     private readonly DispatcherTimer? _tonePreviewTimer;
+    private readonly DispatcherTimer? _viewerRenderDebounceTimer;
 
     private CwsDocument? _document;
     private CwsRenderService? _renderer;
     private DepthMapper? _depthMapper;
     private CancellationTokenSource? _overviewRenderCts;
     private CancellationTokenSource? _viewerRenderCts;
+    private CancellationTokenSource? _viewerPrefetchCts;
+    private long _viewerRenderRequestId;
+    private long _viewerPrefetchGeneration;
 
     private bool _isOverviewSelecting;
     private bool _isOverviewViewportDragging;
@@ -41,6 +48,9 @@ public partial class MainWindow : Window
     private double _overviewZoom = 1d;
     private WarpMap? _currentWarp;
     private HoverState? _currentHoverState;
+    private ViewportRenderState? _viewerRenderState;
+    private ViewerRenderMode _pendingViewerRenderMode = ViewerRenderMode.SmallScroll;
+    private double _lastViewerDisplayStart;
 
     private Point? _pendingZoomAnchorViewportPoint;
     private double? _pendingZoomAnchorDisplayX;
@@ -63,6 +73,12 @@ public partial class MainWindow : Window
             Interval = TimeSpan.FromMilliseconds(150),
         };
         _tonePreviewTimer.Tick += TonePreviewTimer_Tick;
+
+        _viewerRenderDebounceTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(ViewerRenderDebounceMilliseconds),
+        };
+        _viewerRenderDebounceTimer.Tick += ViewerRenderDebounceTimer_Tick;
 
         ApplyUnitSelectionsFromControls();
         UpdateUnitToggleButtons();
@@ -220,6 +236,8 @@ public partial class MainWindow : Window
         EditRegion region = FindMatchingRegion(selectionStart, selectionEnd) ??
             new(Guid.NewGuid(), NextRegionName(), selectionStart, selectionEnd, RegionGeometryMode.None, null, ToneAdjustment.Identity);
         _session.UpsertRegion(region.WithCrop());
+        ClearSelection();
+        CenterViewerOnSourceY(selectionStart);
         await RefreshAllRendersAsync(resetScrollOffset: false, refreshOverview: true);
     }
 
@@ -256,7 +274,7 @@ public partial class MainWindow : Window
 
     private void ClearSelectionButton_Click(object sender, RoutedEventArgs e) => ClearSelection();
 
-    private async void ZoomSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+    private void ZoomSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
     {
         if (ZoomValueTextBlock is not null)
         {
@@ -268,7 +286,10 @@ public partial class MainWindow : Window
             return;
         }
 
-        await RefreshViewerAsync(resetScrollOffset: false);
+        double zoom = Math.Max(0.1d, e.NewValue);
+        UpdateViewerGeometryOnly(zoom);
+        CancelPendingViewerRender();
+        ScheduleViewerRender(ViewerRenderMode.Zoom, forceRender: false);
     }
 
     private async void OverviewZoomSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
@@ -337,7 +358,12 @@ public partial class MainWindow : Window
 
         if (e.VerticalChange != 0 || e.ViewportHeightChange != 0 || e.ViewportWidthChange != 0)
         {
-            await RefreshViewerAsync(resetScrollOffset: false);
+            ViewerRenderMode mode = Math.Abs(e.VerticalChange) >= GetViewerViewportHeight() * 0.65d ||
+                                    e.ViewportHeightChange != 0 ||
+                                    e.ViewportWidthChange != 0
+                ? ViewerRenderMode.PageJump
+                : ViewerRenderMode.SmallScroll;
+            await RefreshViewerAsync(resetScrollOffset: false, forceRender: false, mode);
         }
     }
 
@@ -351,7 +377,7 @@ public partial class MainWindow : Window
         ExecuteWithoutViewerScrollRefresh(() => ViewerScrollViewer.ScrollToVerticalOffset(e.NewValue));
         UpdateSelectionVisuals();
         RefreshHoverInfoFromCurrentPointer();
-        _ = RefreshViewerAsync(resetScrollOffset: false);
+        ScheduleViewerRender(ViewerRenderMode.ScrollbarDrag, forceRender: false);
     }
 
     private void ViewerHorizontalScrollBar_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
@@ -492,7 +518,7 @@ public partial class MainWindow : Window
             CenterViewerOnOverviewPoint(point.Y);
             UpdateSelectionVisuals();
             RefreshHoverInfoFromCurrentPointer();
-            await RefreshViewerAsync(resetScrollOffset: false);
+            await RefreshViewerAsync(resetScrollOffset: false, forceRender: true, ViewerRenderMode.PageJump);
             return;
         }
 
@@ -534,7 +560,7 @@ public partial class MainWindow : Window
         OverviewCanvas.ReleaseMouseCapture();
         UpdateSelectionVisuals();
         RefreshHoverInfoFromCurrentPointer();
-        await RefreshViewerAsync(resetScrollOffset: false);
+        await RefreshViewerAsync(resetScrollOffset: false, forceRender: true, ViewerRenderMode.ScrollbarDrag);
     }
 
     private void ViewerCanvas_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
@@ -550,7 +576,7 @@ public partial class MainWindow : Window
         UpdateSelectionFromViewer(_selectionDragStartPoint.Y, _selectionDragStartPoint.Y);
     }
 
-    private async void ViewerCanvas_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+    private void ViewerCanvas_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
     {
         if (!_isViewerSelecting)
         {
@@ -559,7 +585,8 @@ public partial class MainWindow : Window
 
         _isViewerSelecting = false;
         ViewerCanvas.ReleaseMouseCapture();
-        await RefreshViewerAsync(resetScrollOffset: false);
+        UpdateSelectionVisuals();
+        RefreshHoverInfoFromCurrentPointer();
     }
 
     private void ViewerCanvas_MouseMove(object sender, MouseEventArgs e)
@@ -592,9 +619,17 @@ public partial class MainWindow : Window
     private void Window_Closed(object sender, EventArgs e)
     {
         _tonePreviewTimer?.Stop();
+        _viewerRenderDebounceTimer?.Stop();
         _overviewRenderCts?.Cancel();
         _viewerRenderCts?.Cancel();
+        _viewerPrefetchCts?.Cancel();
         _renderer?.Dispose();
+    }
+
+    private async void ViewerRenderDebounceTimer_Tick(object? sender, EventArgs e)
+    {
+        _viewerRenderDebounceTimer?.Stop();
+        await RefreshViewerAsync(resetScrollOffset: false, forceRender: true, _pendingViewerRenderMode);
     }
 
     private async void TonePreviewTimer_Tick(object? sender, EventArgs e)
@@ -614,20 +649,25 @@ public partial class MainWindow : Window
             SetStatus("Loading CWS archive...");
             _overviewRenderCts?.Cancel();
             _viewerRenderCts?.Cancel();
+            _viewerPrefetchCts?.Cancel();
             _renderer?.Dispose();
 
             _document = await CwsArchive.LoadAsync(path);
             _renderer = new CwsRenderService(_document);
             _depthMapper = new DepthMapper(_document);
             _currentHoverState = null;
+            InvalidateViewerBuffer();
             ResetUnitSelectors();
             ResetEditSession();
             InputPathTextBlock.Text = path;
             OutputPathTextBlock.Text = SuggestOutputPath(path);
             Title = $"Stitch Helper - {Path.GetFileName(path)}";
-            await RefreshAllRendersAsync(resetScrollOffset: true, refreshOverview: true);
+            UpdateRegionList();
+            UpdateSelectionSummary();
+            await RefreshViewerAsync(resetScrollOffset: true, forceRender: true, ViewerRenderMode.PageJump);
             HoverInfoTextBlock.Text = DefaultHoverText;
-            SetStatus($"Loaded {Path.GetFileName(path)}");
+            SetStatus($"Loaded {Path.GetFileName(path)} - rendering overview...");
+            _ = RefreshOverviewAfterLoadAsync(_document, Path.GetFileName(path));
         }
         catch (Exception ex)
         {
@@ -642,6 +682,7 @@ public partial class MainWindow : Window
 
     private async Task RefreshAllRendersAsync(bool resetScrollOffset, bool refreshOverview)
     {
+        InvalidateViewerBuffer();
         UpdateRegionList();
         UpdateSelectionSummary();
         if (refreshOverview)
@@ -649,7 +690,7 @@ public partial class MainWindow : Window
             await RefreshOverviewAsync();
         }
 
-        await RefreshViewerAsync(resetScrollOffset);
+        await RefreshViewerAsync(resetScrollOffset, forceRender: true, ViewerRenderMode.PageJump);
     }
 
     private async Task RefreshOverviewAsync()
@@ -667,18 +708,18 @@ public partial class MainWindow : Window
         try
         {
             WarpMap warp = GetCurrentWarp();
-            using MagickImage image = await _renderer.RenderOverviewImageAsync(_session, warp, _overviewZoom, cancellationToken);
-            OverviewImage.Source = ToBitmapSource(image);
+            RenderedBitmap rendered = await RenderOverviewBitmapAsync(_renderer, warp, _overviewZoom, cancellationToken);
+            OverviewImage.Source = rendered.Source;
 
             double overviewViewportWidth = GetOverviewViewportWidth();
             double canvasWidth = Math.Max(1d, overviewViewportWidth > 0d
                 ? overviewViewportWidth
                 : Math.Max(OverviewScrollViewer.ActualWidth - 8d, 1d));
             OverviewCanvas.Width = canvasWidth;
-            OverviewCanvas.Height = image.Height;
+            OverviewCanvas.Height = rendered.PixelHeight;
             OverviewImage.Width = canvasWidth;
-            OverviewImage.Height = image.Height;
-            _currentOverviewVerticalScale = _currentDisplayHeight <= 0d ? 0d : image.Height / _currentDisplayHeight;
+            OverviewImage.Height = rendered.PixelHeight;
+            _currentOverviewVerticalScale = _currentDisplayHeight <= 0d ? 0d : rendered.PixelHeight / _currentDisplayHeight;
             ApplyPendingOverviewZoomAnchorIfNeeded();
             UpdateOverviewScrollBar();
             UpdateSelectionVisuals();
@@ -692,7 +733,7 @@ public partial class MainWindow : Window
         }
     }
 
-    private async Task RefreshViewerAsync(bool resetScrollOffset)
+    private async Task RefreshViewerAsync(bool resetScrollOffset, bool forceRender = false, ViewerRenderMode mode = ViewerRenderMode.SmallScroll)
     {
         if (_document is null || _renderer is null)
         {
@@ -710,34 +751,45 @@ public partial class MainWindow : Window
         }
 
         double zoom = Math.Max(0.1d, ZoomSlider.Value);
-        ViewerCanvas.Width = _document.CompositeWidth * zoom;
-        ViewerCanvas.Height = Math.Max(1d, _currentDisplayHeight * zoom);
-        ApplyPendingZoomAnchorIfNeeded(zoom);
-        UpdateViewerScrollBars();
-        UpdateSelectionVisuals();
+        UpdateViewerGeometryOnly(zoom);
 
         double viewerViewportHeight = GetViewerViewportHeight();
-        double displayStart = Math.Max(0d, (GetViewerVerticalOffset() / zoom) - (220d / zoom));
-        double displayHeight = Math.Min(_currentDisplayHeight - displayStart, (viewerViewportHeight / zoom) + (440d / zoom));
-        if (displayHeight <= 0d)
+        double visibleDisplayStart = Math.Clamp(GetViewerVerticalOffset() / zoom, 0d, _currentDisplayHeight);
+        double visibleDisplayHeight = Math.Max(1d, viewerViewportHeight / zoom);
+        double visibleDisplayEnd = Math.Min(_currentDisplayHeight, visibleDisplayStart + visibleDisplayHeight);
+
+        if (!forceRender && CanReuseViewerRender(visibleDisplayStart, visibleDisplayEnd, zoom))
         {
-            displayHeight = Math.Max(1d, viewerViewportHeight / zoom);
+            PositionViewportImage(zoom);
+            UpdateSelectionVisuals();
+            RefreshHoverInfoFromCurrentPointer();
+            return;
         }
+
+        (double displayStart, double displayEnd) = CalculateViewerRenderRange(mode, visibleDisplayStart, visibleDisplayEnd, visibleDisplayHeight, zoom);
+        double displayHeight = Math.Max(1d, displayEnd - displayStart);
+        _lastViewerDisplayStart = visibleDisplayStart;
 
         _viewerRenderCts?.Cancel();
         _viewerRenderCts = new CancellationTokenSource();
         CancellationToken cancellationToken = _viewerRenderCts.Token;
+        long requestId = Interlocked.Increment(ref _viewerRenderRequestId);
 
         try
         {
-            using MagickImage image = await _renderer.RenderViewportImageAsync(_session, warp, displayStart, displayHeight, zoom, cancellationToken);
-            ViewportImage.Source = ToBitmapSource(image);
-            Canvas.SetLeft(ViewportImage, 0d);
-            Canvas.SetTop(ViewportImage, displayStart * zoom);
-            ViewportImage.Width = image.Width;
-            ViewportImage.Height = image.Height;
+            bool useRenderTileCache = mode == ViewerRenderMode.SmallScroll;
+            RenderedBitmap rendered = await RenderViewportBitmapAsync(_renderer, warp, displayStart, displayHeight, useRenderTileCache, cancellationToken);
+            if (requestId != Interlocked.Read(ref _viewerRenderRequestId) || cancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
+
+            ViewportImage.Source = rendered.Source;
+            _viewerRenderState = new ViewportRenderState(displayStart, displayStart + rendered.PixelHeight, zoom, rendered.PixelWidth, rendered.PixelHeight);
+            PositionViewportImage(zoom);
             UpdateSelectionVisuals();
             RefreshHoverInfoFromCurrentPointer();
+            StartViewerPrefetch(warp, displayStart, displayHeight);
         }
         catch (OperationCanceledException)
         {
@@ -746,6 +798,183 @@ public partial class MainWindow : Window
         {
             SetStatus($"Viewer render failed: {ex.Message}");
         }
+    }
+
+    private async Task RefreshOverviewAfterLoadAsync(CwsDocument document, string fileName)
+    {
+        try
+        {
+            await RefreshOverviewAsync();
+            if (ReferenceEquals(_document, document))
+            {
+                SetStatus($"Loaded {fileName}");
+            }
+        }
+        catch (Exception ex)
+        {
+            if (ReferenceEquals(_document, document))
+            {
+                SetStatus($"Overview render failed: {ex.Message}");
+            }
+        }
+    }
+
+    private void UpdateViewerGeometryOnly(double zoom)
+    {
+        if (_document is null)
+        {
+            return;
+        }
+
+        ViewerCanvas.Width = _document.CompositeWidth * zoom;
+        ViewerCanvas.Height = Math.Max(1d, _currentDisplayHeight * zoom);
+        ApplyPendingZoomAnchorIfNeeded(zoom);
+        PositionViewportImage(zoom);
+        UpdateViewerScrollBars();
+        UpdateSelectionVisuals();
+        RefreshHoverInfoFromCurrentPointer();
+    }
+
+    private void StartViewerPrefetch(WarpMap warp, double displayStart, double displayHeight)
+    {
+        if (_renderer is null)
+        {
+            return;
+        }
+
+        _viewerPrefetchCts?.Cancel();
+        _viewerPrefetchCts = new CancellationTokenSource();
+        CancellationToken cancellationToken = _viewerPrefetchCts.Token;
+        long generation = Interlocked.Increment(ref _viewerPrefetchGeneration);
+        _ = PrefetchViewerAsync(_renderer, warp, displayStart, displayHeight, generation, cancellationToken);
+    }
+
+    private async Task PrefetchViewerAsync(
+        CwsRenderService renderer,
+        WarpMap warp,
+        double displayStart,
+        double displayHeight,
+        long generation,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await renderer.PrefetchViewportAsync(_session, warp, displayStart, displayHeight, cancellationToken);
+            _ = generation == Interlocked.Read(ref _viewerPrefetchGeneration);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch
+        {
+            // Prefetch is opportunistic; visible renders should not surface prefetch failures.
+        }
+    }
+
+    private Task<RenderedBitmap> RenderViewportBitmapAsync(
+        CwsRenderService renderer,
+        WarpMap warp,
+        double displayStart,
+        double displayHeight,
+        bool useRenderTileCache,
+        CancellationToken cancellationToken)
+    {
+        return Task.Run(
+            () =>
+            {
+                using MagickImage image = renderer.RenderViewportImage(_session, warp, displayStart, displayHeight, 1d, cancellationToken, useRenderTileCache);
+                return ToRenderedBitmap(image);
+            },
+            cancellationToken);
+    }
+
+    private Task<RenderedBitmap> RenderOverviewBitmapAsync(
+        CwsRenderService renderer,
+        WarpMap warp,
+        double overviewZoom,
+        CancellationToken cancellationToken)
+    {
+        return Task.Run(
+            () =>
+            {
+                using MagickImage image = renderer.RenderOverviewImage(_session, warp, overviewZoom, cancellationToken);
+                return ToRenderedBitmap(image);
+            },
+            cancellationToken);
+    }
+
+    private (double Start, double End) CalculateViewerRenderRange(
+        ViewerRenderMode mode,
+        double visibleDisplayStart,
+        double visibleDisplayEnd,
+        double visibleDisplayHeight,
+        double zoom)
+    {
+        double minimumBuffer = ViewerRenderMinimumBufferDisplayPixels / zoom;
+        double before;
+        double after;
+
+        switch (mode)
+        {
+            case ViewerRenderMode.PageJump:
+                before = Math.Max(minimumBuffer * 0.35d, visibleDisplayHeight * 0.08d);
+                after = Math.Max(minimumBuffer * 0.35d, visibleDisplayHeight * 0.08d);
+                break;
+            case ViewerRenderMode.Zoom:
+                before = Math.Max(minimumBuffer * 0.5d, visibleDisplayHeight * 0.18d);
+                after = before;
+                break;
+            case ViewerRenderMode.ScrollbarDrag:
+                before = Math.Max(minimumBuffer * 0.5d, visibleDisplayHeight * 0.14d);
+                after = before;
+                break;
+            default:
+                double directional = Math.Max(minimumBuffer, visibleDisplayHeight * 0.9d);
+                double trailing = Math.Max(minimumBuffer * 0.35d, visibleDisplayHeight * 0.25d);
+                bool movingDown = visibleDisplayStart >= _lastViewerDisplayStart;
+                before = movingDown ? trailing : directional;
+                after = movingDown ? directional : trailing;
+                break;
+        }
+
+        return (
+            Math.Max(0d, visibleDisplayStart - before),
+            Math.Min(_currentDisplayHeight, visibleDisplayEnd + after));
+    }
+
+    private bool CanReuseViewerRender(double visibleDisplayStart, double visibleDisplayEnd, double zoom)
+    {
+        if (_viewerRenderState is not ViewportRenderState state || ViewportImage.Source is null)
+        {
+            return false;
+        }
+
+        if (Math.Abs(state.Zoom - zoom) > 0.0001d)
+        {
+            return false;
+        }
+
+        double edge = Math.Max(1d, Math.Min((state.DisplayEnd - state.DisplayStart) * 0.2d, ViewerRenderMinimumBufferDisplayPixels / zoom * 0.5d));
+        bool startOk = state.DisplayStart <= 0.0001d
+            ? visibleDisplayStart >= state.DisplayStart
+            : visibleDisplayStart >= state.DisplayStart + edge;
+        bool endOk = state.DisplayEnd >= _currentDisplayHeight - 0.0001d
+            ? visibleDisplayEnd <= state.DisplayEnd
+            : visibleDisplayEnd <= state.DisplayEnd - edge;
+        return startOk && endOk;
+    }
+
+    private void PositionViewportImage(double zoom)
+    {
+        if (_viewerRenderState is not ViewportRenderState state)
+        {
+            return;
+        }
+
+        Canvas.SetLeft(ViewportImage, 0d);
+        Canvas.SetTop(ViewportImage, state.DisplayStart * zoom);
+        ViewportImage.Width = state.PixelWidth * zoom;
+        ViewportImage.Height = state.PixelHeight * zoom;
     }
 
     private void UpdateSelectionFromOverviewSurface(double startY, double endY)
@@ -1178,7 +1407,8 @@ public partial class MainWindow : Window
         else
         {
             UpdateRegionList();
-            await RefreshViewerAsync(resetScrollOffset: false);
+            InvalidateViewerBuffer();
+            await RefreshViewerAsync(resetScrollOffset: false, forceRender: true, ViewerRenderMode.PageJump);
         }
     }
 
@@ -1333,6 +1563,32 @@ public partial class MainWindow : Window
         }
     }
 
+    private void InvalidateViewerBuffer()
+    {
+        _viewerRenderState = null;
+        CancelPendingViewerRender();
+    }
+
+    private void CancelPendingViewerRender()
+    {
+        _viewerRenderCts?.Cancel();
+        _viewerPrefetchCts?.Cancel();
+        Interlocked.Increment(ref _viewerRenderRequestId);
+        Interlocked.Increment(ref _viewerPrefetchGeneration);
+    }
+
+    private void ScheduleViewerRender(ViewerRenderMode mode, bool forceRender)
+    {
+        _pendingViewerRenderMode = mode;
+        if (forceRender)
+        {
+            InvalidateViewerBuffer();
+        }
+
+        _viewerRenderDebounceTimer?.Stop();
+        _viewerRenderDebounceTimer?.Start();
+    }
+
     private ToneTarget GetToneTargetFromControl(DependencyObject control)
     {
         return control == SelectionBrightnessSlider ||
@@ -1356,7 +1612,7 @@ public partial class MainWindow : Window
             ZoomSlider.Value = targetZoom;
         }
 
-        await RefreshViewerAsync(resetScrollOffset: false);
+        await RefreshViewerAsync(resetScrollOffset: false, forceRender: true, ViewerRenderMode.PageJump);
 
         WarpMap warp = GetCurrentWarp();
         double displayCenter = (warp.Forward(region.NormalizedStart) + warp.Forward(region.NormalizedEnd)) / 2d;
@@ -1369,7 +1625,7 @@ public partial class MainWindow : Window
         });
 
         UpdateSelectionVisuals();
-        await RefreshViewerAsync(resetScrollOffset: false);
+        await RefreshViewerAsync(resetScrollOffset: false, forceRender: true, ViewerRenderMode.PageJump);
     }
 
     private double ConvertDepth(double rawDepth) =>
@@ -1439,6 +1695,26 @@ public partial class MainWindow : Window
         double targetDisplayStart = targetDisplayCenter - (viewerViewportHeight / zoom / 2d);
         double maxVerticalOffset = Math.Max(0d, GetViewerExtentHeight() - viewerViewportHeight);
         ViewerScrollViewer.ScrollToVerticalOffset(Math.Clamp(targetDisplayStart * zoom, 0d, maxVerticalOffset));
+        UpdateOverviewViewportVisual();
+    }
+
+    private void CenterViewerOnSourceY(double sourceY)
+    {
+        if (_document is null)
+        {
+            return;
+        }
+
+        WarpMap warp = GetCurrentWarp();
+        double zoom = Math.Max(0.1d, ZoomSlider.Value);
+        double targetDisplayCenter = Math.Clamp(warp.Forward(sourceY), 0d, _currentDisplayHeight);
+        double viewerViewportHeight = GetViewerViewportHeight();
+        double targetDisplayStart = targetDisplayCenter - (viewerViewportHeight / zoom / 2d);
+        double maxVerticalOffset = Math.Max(0d, GetViewerExtentHeight() - viewerViewportHeight);
+        ExecuteWithoutViewerScrollRefresh(() =>
+        {
+            ViewerScrollViewer.ScrollToVerticalOffset(Math.Clamp(targetDisplayStart * zoom, 0d, maxVerticalOffset));
+        });
         UpdateOverviewViewportVisual();
     }
 
@@ -1545,13 +1821,21 @@ public partial class MainWindow : Window
         double.TryParse(text, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out value) ||
         double.TryParse(text, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.CurrentCulture, out value);
 
+    private static RenderedBitmap ToRenderedBitmap(MagickImage image)
+    {
+        BitmapSource source = ToBitmapSource(image);
+        return new RenderedBitmap(source, image.Width, image.Height);
+    }
+
     private static BitmapSource ToBitmapSource(MagickImage image)
     {
-        byte[] data = image.ToByteArray(MagickFormat.Png);
-        using MemoryStream stream = new(data);
-        BitmapFrame frame = BitmapFrame.Create(stream, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad);
-        frame.Freeze();
-        return frame;
+        int width = checked((int)image.Width);
+        int height = checked((int)image.Height);
+        int stride = checked(width * 4);
+        byte[] pixels = image.ToByteArray(MagickFormat.Bgra);
+        BitmapSource source = BitmapSource.Create(width, height, 96d, 96d, PixelFormats.Bgra32, null, pixels, stride);
+        source.Freeze();
+        return source;
     }
 
     private static string SuggestOutputPath(string sourcePath)
@@ -1605,9 +1889,21 @@ public partial class MainWindow : Window
 
     private sealed record HoverState(Point CanvasPoint, DepthInfo Info, double WrapAngle);
 
+    private sealed record ViewportRenderState(double DisplayStart, double DisplayEnd, double Zoom, uint PixelWidth, uint PixelHeight);
+
+    private sealed record RenderedBitmap(BitmapSource Source, uint PixelWidth, uint PixelHeight);
+
     private enum ToneTarget
     {
         Global,
         Selection,
+    }
+
+    private enum ViewerRenderMode
+    {
+        SmallScroll,
+        PageJump,
+        Zoom,
+        ScrollbarDrag,
     }
 }

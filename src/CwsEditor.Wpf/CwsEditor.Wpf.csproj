@@ -24,4 +24,19 @@
     <Product>Stitch Helper</Product>
   </PropertyGroup>
 
+  <PropertyGroup Condition="'$(BetaBuild)' == 'true'">
+    <AssemblyName>Stitch Helper BETA</AssemblyName>
+    <Product>Stitch Helper BETA</Product>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Beta2Build)' == 'true'">
+    <AssemblyName>Stitch Helper BETA 2</AssemblyName>
+    <Product>Stitch Helper BETA 2</Product>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Beta3Build)' == 'true'">
+    <AssemblyName>Stitch Helper BETA 3</AssemblyName>
+    <Product>Stitch Helper BETA 3</Product>
+  </PropertyGroup>
+
 </Project>

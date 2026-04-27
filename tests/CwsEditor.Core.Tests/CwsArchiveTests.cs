@@ -1,5 +1,6 @@
 using System.IO.Compression;
 using System.Text;
+using System.Text.Json.Nodes;
 using CwsEditor.Core;
 using ImageMagick;
 
@@ -24,6 +25,51 @@ public sealed class CwsArchiveTests
         Assert.Equal(3, document.ThumbnailWidth);
         Assert.Equal(3, document.DepthSamples.Count);
         Assert.Contains("Telemetry", document.TelemetryText);
+    }
+
+    [Theory]
+    [InlineData("15/04/26 12:00:00.000 0.000 10.0")]
+    [InlineData("15-04-26 12:00:00.000 0.000 10.0")]
+    public void DepthSampleParseAcceptsObservedEvDateFormats(string line)
+    {
+        DepthSample sample = DepthSample.Parse(line);
+
+        Assert.Equal(0d, sample.Depth);
+        Assert.Equal(10d, sample.Orientation);
+    }
+
+    [Fact]
+    public async Task GetStripsOverlappingReturnsOnlyIntersectingStrips()
+    {
+        using TempDirectory temp = new();
+        string sourcePath = await SampleCwsFactory.CreateAsync(temp.Path);
+        CwsDocument document = await CwsArchive.LoadAsync(sourcePath);
+
+        Assert.Equal(new[] { 0 }, document.GetStripsOverlapping(0d, 2.5d).Select(strip => strip.Index));
+        Assert.Equal(new[] { 0, 1 }, document.GetStripsOverlapping(3d, 4d).Select(strip => strip.Index));
+        Assert.Equal(new[] { 1 }, document.GetStripsOverlapping(4d, 7d).Select(strip => strip.Index));
+    }
+
+    [Fact]
+    public async Task LoadAsyncNormalizesNegativeLayoutOffsetsForExport()
+    {
+        using TempDirectory temp = new();
+        string sourcePath = await SampleCwsFactory.CreateAsync(temp.Path, useNegativeOffsets: true);
+        string outputPath = Path.Combine(temp.Path, "negative-offset-export.cws");
+        CwsDocument document = await CwsArchive.LoadAsync(sourcePath);
+
+        Assert.Equal(7d, document.SourceHeight);
+        Assert.Equal(3, document.StripStride);
+        Assert.Equal(new[] { 0, 3 }, document.Strips.Select(strip => strip.YOffset));
+
+        EditSession session = new()
+        {
+            GlobalVerticalScale = 1.1d,
+        };
+        await CwsArchive.SaveEditedAsync(document, session, outputPath).WaitAsync(TimeSpan.FromSeconds(10));
+        CwsDocument exported = await CwsArchive.LoadAsync(outputPath);
+
+        Assert.True(exported.SourceHeight > document.SourceHeight);
     }
 
     [Fact]
@@ -73,6 +119,90 @@ public sealed class CwsArchiveTests
     }
 
     [Fact]
+    public async Task RenderViewportWithCropMovesFollowingPixelsUp()
+    {
+        using TempDirectory temp = new();
+        string sourcePath = await SampleCwsFactory.CreateAsync(temp.Path);
+        CwsDocument document = await CwsArchive.LoadAsync(sourcePath);
+        using CwsRenderService renderer = new(document);
+
+        EditSession session = new();
+        session.UpsertRegion(new EditRegion(Guid.NewGuid(), "Crop", 1d, 3d, RegionGeometryMode.Crop, null, ToneAdjustment.Identity));
+        WarpMap warp = session.BuildWarpMap(document.SourceHeight);
+
+        using MagickImage image = await renderer.RenderViewportImageAsync(session, warp, 0d, warp.TotalDisplayHeight, 1d);
+        var pixels = image.GetPixels();
+        var top = pixels.GetPixel(0, 0).ToColor();
+        var afterCrop = pixels.GetPixel(0, 1).ToColor();
+
+        Assert.NotNull(top);
+        Assert.NotNull(afterCrop);
+        Assert.True(top!.R > 200);
+        Assert.True(top.G < 30);
+        Assert.True(top.B < 30);
+        Assert.True(afterCrop!.B > 200);
+        Assert.True(afterCrop.R < 30);
+        Assert.True(afterCrop.G < 30);
+    }
+
+    [Fact]
+    public async Task FastIdentityRenderMatchesGenericRender()
+    {
+        using TempDirectory temp = new();
+        string sourcePath = await SampleCwsFactory.CreateAsync(temp.Path);
+        CwsDocument document = await CwsArchive.LoadAsync(sourcePath);
+        EditSession session = new();
+        WarpMap warp = session.BuildWarpMap(document.SourceHeight);
+
+        using CwsRenderService fastRenderer = new(document, renderTileCacheByteLimit: 0, enableFastPath: true);
+        using CwsRenderService genericRenderer = new(document, renderTileCacheByteLimit: 0, enableFastPath: false);
+        using MagickImage fast = fastRenderer.RenderViewportImage(session, warp, 0d, document.SourceHeight, 1d);
+        using MagickImage generic = genericRenderer.RenderViewportImage(session, warp, 0d, document.SourceHeight, 1d);
+
+        AssertSamePixels(generic, fast);
+    }
+
+    [Fact]
+    public async Task FastRendererMatchesGenericRenderWithToneCropAndScale()
+    {
+        using TempDirectory temp = new();
+        string sourcePath = await SampleCwsFactory.CreateAsync(temp.Path);
+        CwsDocument document = await CwsArchive.LoadAsync(sourcePath);
+        EditSession session = new()
+        {
+            GlobalTone = new ToneAdjustment(5d, 3d, 0d, false),
+        };
+        session.UpsertRegion(new EditRegion(Guid.NewGuid(), "Scale", 0d, 1d, RegionGeometryMode.Scale, 1.2d, ToneAdjustment.Identity));
+        session.UpsertRegion(new EditRegion(Guid.NewGuid(), "Crop", 1d, 2d, RegionGeometryMode.Crop, null, ToneAdjustment.Identity));
+        session.UpsertRegion(new EditRegion(Guid.NewGuid(), "Tone", 3d, 5d, RegionGeometryMode.None, null, new ToneAdjustment(-5d, 0d, 0d, false)));
+        WarpMap warp = session.BuildWarpMap(document.SourceHeight);
+
+        using CwsRenderService fastRenderer = new(document, renderTileCacheByteLimit: 0, enableFastPath: true);
+        using CwsRenderService genericRenderer = new(document, renderTileCacheByteLimit: 0, enableFastPath: false);
+        using MagickImage fast = fastRenderer.RenderViewportImage(session, warp, 0d, warp.TotalDisplayHeight, 1d);
+        using MagickImage generic = genericRenderer.RenderViewportImage(session, warp, 0d, warp.TotalDisplayHeight, 1d);
+
+        AssertSamePixels(generic, fast);
+    }
+
+    [Fact]
+    public async Task RenderTileCacheReusesOverlappingViewportTiles()
+    {
+        using TempDirectory temp = new();
+        string sourcePath = await SampleCwsFactory.CreateAsync(temp.Path);
+        CwsDocument document = await CwsArchive.LoadAsync(sourcePath);
+        EditSession session = new();
+        WarpMap warp = session.BuildWarpMap(document.SourceHeight);
+        using CwsRenderService renderer = new(document, renderTileCacheByteLimit: 1024 * 1024);
+
+        using MagickImage first = renderer.RenderViewportImage(session, warp, 0d, 3d, 1d);
+        using MagickImage second = renderer.RenderViewportImage(session, warp, 1d, 3d, 1d);
+
+        Assert.True(renderer.CacheStats.TileMisses >= 1);
+        Assert.True(renderer.CacheStats.TileHits >= 1);
+    }
+
+    [Fact]
     public async Task SaveEditedAsyncPreservesPassthroughAndExpandsLayout()
     {
         using TempDirectory temp = new();
@@ -97,6 +227,27 @@ public sealed class CwsArchiveTests
         Assert.True(outputDocument.Strips.Count > sourceDocument.Strips.Count);
         Assert.True(outputDocument.SourceHeight > sourceDocument.SourceHeight);
         Assert.NotEmpty(outputDocument.StitchMetadata.Displacements);
+
+        JsonObject stitchJson = await ReadStitchJsonAsync(outputPath);
+        JsonArray displacements = stitchJson["displacements"]?.AsArray() ?? throw new InvalidOperationException("Missing displacements array.");
+        JsonObject debug = stitchJson["debug"]?.AsObject() ?? throw new InvalidOperationException("Missing debug object.");
+        JsonArray movement = debug["movement"]?.AsArray() ?? throw new InvalidOperationException("Missing movement array.");
+        JsonArray cumulative = debug["cumulative"]?.AsArray() ?? throw new InvalidOperationException("Missing cumulative array.");
+
+        Assert.Equal(displacements.Count, movement.Count);
+        Assert.Equal(displacements.Count, cumulative.Count);
+
+        double runningX = 0d;
+        double runningY = 0d;
+        for (int index = 0; index < movement.Count; index++)
+        {
+            JsonObject step = movement[index]?.AsObject() ?? throw new InvalidOperationException($"Missing movement[{index}] object.");
+            JsonObject total = cumulative[index]?.AsObject() ?? throw new InvalidOperationException($"Missing cumulative[{index}] object.");
+            runningX += step["x"]?.GetValue<double>() ?? 0d;
+            runningY += step["y"]?.GetValue<double>() ?? 0d;
+            Assert.Equal(runningX, total["x"]?.GetValue<double>() ?? double.NaN);
+            Assert.Equal(runningY, total["y"]?.GetValue<double>() ?? double.NaN);
+        }
     }
 
     [Fact]
@@ -115,11 +266,25 @@ public sealed class CwsArchiveTests
 
         Assert.True(outputDocument.SourceHeight < sourceDocument.SourceHeight);
         Assert.Equal(sourceDocument.PassthroughEntries["Depth.txt"].Data, outputDocument.PassthroughEntries["Depth.txt"].Data);
+
+        using MagickImage firstOutputImage = await ReadImageEntryAsync(outputPath, "images/00000.png");
+        var pixels = firstOutputImage.GetPixels();
+        var top = pixels.GetPixel(0, 0).ToColor();
+        var afterCrop = pixels.GetPixel(0, 1).ToColor();
+
+        Assert.NotNull(top);
+        Assert.NotNull(afterCrop);
+        Assert.True(top!.R > 200);
+        Assert.True(top.G < 30);
+        Assert.True(top.B < 30);
+        Assert.True(afterCrop!.B > 200);
+        Assert.True(afterCrop.R < 30);
+        Assert.True(afterCrop.G < 30);
     }
 
     private static class SampleCwsFactory
     {
-        public static async Task<string> CreateAsync(string directory)
+        public static async Task<string> CreateAsync(string directory, bool useNegativeOffsets = false)
         {
             Directory.CreateDirectory(directory);
             string path = Path.Combine(directory, "sample.cws");
@@ -144,7 +309,7 @@ public sealed class CwsArchiveTests
             await WriteEntryAsync(archive, "images/00001.png", CreateSolidPng(MagickColors.Blue, 6, 4));
             await WriteEntryAsync(archive, "thumbs/00000.png", CreateSolidPng(MagickColors.Red, 3, 2));
             await WriteEntryAsync(archive, "thumbs/00001.png", CreateSolidPng(MagickColors.Blue, 3, 2));
-            await WriteEntryAsync(archive, "Stitch.dat", BuildStitchJson());
+            await WriteEntryAsync(archive, "Stitch.dat", BuildStitchJson(useNegativeOffsets));
 
             return path;
         }
@@ -167,13 +332,15 @@ public sealed class CwsArchiveTests
             await entryStream.WriteAsync(content);
         }
 
-        private static string BuildStitchJson()
+        private static string BuildStitchJson(bool useNegativeOffsets)
         {
-            return
+            string firstYOffset = useNegativeOffsets ? "0" : "0";
+            string secondYOffset = useNegativeOffsets ? "-3" : "3";
+            string json =
                 """
                 {"layout":[
-                {"image":"00000.png","width":6,"height":4,"x offset":0,"y offset":0},
-                {"image":"00001.png","width":6,"height":4,"x offset":0,"y offset":3}
+                {"image":"00000.png","width":6,"height":4,"x offset":0,"y offset":__FIRST_Y_OFFSET__},
+                {"image":"00001.png","width":6,"height":4,"x offset":0,"y offset":__SECOND_Y_OFFSET__}
                 ],
                 "attributes":[],
                 "highlights":[],
@@ -194,9 +361,49 @@ public sealed class CwsArchiveTests
                 {"x":0.0,"y":1.0},
                 {"x":0.0,"y":1.0},
                 {"x":0.0,"y":1.0}
+                ],"cumulative":[
+                {"x":0.0,"y":1.0},
+                {"x":0.0,"y":2.0},
+                {"x":0.0,"y":3.0},
+                {"x":0.0,"y":4.0},
+                {"x":0.0,"y":5.0},
+                {"x":0.0,"y":6.0},
+                {"x":0.0,"y":7.0}
                 ],"time taken":"00:00:00","total frames":0,"frames per second":0.0}}
                 """.ReplaceLineEndings(string.Empty);
+            return json
+                .Replace("__FIRST_Y_OFFSET__", firstYOffset, StringComparison.Ordinal)
+                .Replace("__SECOND_Y_OFFSET__", secondYOffset, StringComparison.Ordinal);
         }
+    }
+
+    private static async Task<JsonObject> ReadStitchJsonAsync(string cwsPath)
+    {
+        using FileStream stream = new(cwsPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        using ZipArchive archive = new(stream, ZipArchiveMode.Read, leaveOpen: false);
+        ZipArchiveEntry entry = archive.GetEntry("Stitch.dat") ?? throw new InvalidOperationException("Stitch.dat was not found.");
+        using StreamReader reader = new(entry.Open());
+        string json = await reader.ReadToEndAsync();
+        return JsonNode.Parse(json)?.AsObject() ?? throw new InvalidOperationException("Stitch.dat is not valid JSON.");
+    }
+
+    private static async Task<MagickImage> ReadImageEntryAsync(string cwsPath, string entryName)
+    {
+        using FileStream stream = new(cwsPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        using ZipArchive archive = new(stream, ZipArchiveMode.Read, leaveOpen: false);
+        ZipArchiveEntry entry = archive.GetEntry(entryName) ?? throw new InvalidOperationException($"{entryName} was not found.");
+        await using Stream entryStream = entry.Open();
+        using MemoryStream buffer = new();
+        await entryStream.CopyToAsync(buffer);
+        buffer.Position = 0;
+        return new MagickImage(buffer);
+    }
+
+    private static void AssertSamePixels(MagickImage expected, MagickImage actual)
+    {
+        Assert.Equal(expected.Width, actual.Width);
+        Assert.Equal(expected.Height, actual.Height);
+        Assert.Equal(expected.ToByteArray(MagickFormat.Rgba), actual.ToByteArray(MagickFormat.Rgba));
     }
 
     private sealed class TempDirectory : IDisposable

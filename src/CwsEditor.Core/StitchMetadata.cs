@@ -118,6 +118,7 @@ public sealed class StitchMetadata
 
         JsonObject debug = root["debug"]?.AsObject() ?? [];
         debug["movement"] = BuildMovementArray(movementVectors);
+        debug["cumulative"] = BuildCumulativeArray(movementVectors);
         root["debug"] = debug;
 
         return root.ToJsonString(new JsonSerializerOptions
@@ -176,6 +177,28 @@ public sealed class StitchMetadata
                 {
                     ["x"] = movement.X,
                     ["y"] = movement.Y,
+                });
+        }
+
+        return array;
+    }
+
+    private static JsonArray BuildCumulativeArray(IReadOnlyList<MovementVector> movementVectors)
+    {
+        JsonArray array = [];
+        double cumulativeX = 0d;
+        double cumulativeY = 0d;
+
+        foreach (MovementVector movement in movementVectors)
+        {
+            cumulativeX += movement.X;
+            cumulativeY += movement.Y;
+
+            array.Add(
+                new JsonObject
+                {
+                    ["x"] = cumulativeX,
+                    ["y"] = cumulativeY,
                 });
         }
 

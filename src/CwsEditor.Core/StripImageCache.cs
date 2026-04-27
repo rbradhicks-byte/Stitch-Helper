@@ -6,15 +6,21 @@ namespace CwsEditor.Core;
 internal sealed class StripImageCache : IDisposable
 {
     private readonly object _sync = new();
+    private readonly object _archiveSync = new();
     private readonly CwsDocument _document;
     private readonly int _capacity;
+    private readonly FileStream _archiveStream;
+    private readonly ZipFile _zipFile;
     private readonly Dictionary<string, LinkedListNode<CacheItem>> _nodesByEntry = [];
     private readonly LinkedList<CacheItem> _lru = [];
+    private volatile bool _disposed;
 
-    public StripImageCache(CwsDocument document, int capacity = 6)
+    public StripImageCache(CwsDocument document, int capacity = 24)
     {
         _document = document;
         _capacity = Math.Max(2, capacity);
+        _archiveStream = new FileStream(_document.SourcePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        _zipFile = new ZipFile(_archiveStream) { IsStreamOwner = false };
     }
 
     public MagickImage GetFullStrip(CwsStrip strip)
@@ -25,6 +31,12 @@ internal sealed class StripImageCache : IDisposable
 
     public MagickImage GetThumbStrip(CwsStrip strip)
     {
+        if (!string.IsNullOrWhiteSpace(strip.ThumbEntryName))
+        {
+            string key = $"thumb::{strip.ThumbEntryName}";
+            return GetOrLoad(key, () => LoadImage(strip.ThumbEntryName));
+        }
+
         if (strip.ThumbBytes is null)
         {
             using MagickImage fullImage = GetFullStrip(strip);
@@ -33,14 +45,25 @@ internal sealed class StripImageCache : IDisposable
             return resized;
         }
 
-        string key = $"thumb::{strip.ThumbEntryName}";
-        return GetOrLoad(key, () => new MagickImage(strip.ThumbBytes));
+        string embeddedKey = $"thumb-bytes::{strip.ImageEntryName}";
+        return GetOrLoad(embeddedKey, () => new MagickImage(strip.ThumbBytes));
+    }
+
+    public void PrefetchFullStrip(CwsStrip strip)
+    {
+        using MagickImage _ = GetFullStrip(strip);
     }
 
     public void Dispose()
     {
         lock (_sync)
         {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
             foreach (CacheItem item in _lru)
             {
                 item.Image.Dispose();
@@ -49,12 +72,19 @@ internal sealed class StripImageCache : IDisposable
             _lru.Clear();
             _nodesByEntry.Clear();
         }
+
+        lock (_archiveSync)
+        {
+            _zipFile.Close();
+            _archiveStream.Dispose();
+        }
     }
 
     private MagickImage GetOrLoad(string key, Func<MagickImage> factory)
     {
         lock (_sync)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             if (_nodesByEntry.TryGetValue(key, out LinkedListNode<CacheItem>? existing))
             {
                 _lru.Remove(existing);
@@ -66,6 +96,12 @@ internal sealed class StripImageCache : IDisposable
         MagickImage loaded = factory();
         lock (_sync)
         {
+            if (_disposed)
+            {
+                loaded.Dispose();
+                ObjectDisposedException.ThrowIf(_disposed, this);
+            }
+
             if (_nodesByEntry.TryGetValue(key, out LinkedListNode<CacheItem>? existing))
             {
                 loaded.Dispose();
@@ -100,14 +136,16 @@ internal sealed class StripImageCache : IDisposable
 
     private MagickImage LoadImage(string entryName)
     {
-        using FileStream stream = new(_document.SourcePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-        using ZipFile zipFile = new(stream) { IsStreamOwner = false };
-        ZipEntry entry = zipFile.GetEntry(entryName) ?? throw new CwsEditorException($"Archive entry was not found: {entryName}");
-        using Stream entryStream = zipFile.GetInputStream(entry);
-        using MemoryStream copy = new();
-        entryStream.CopyTo(copy);
-        copy.Position = 0;
-        return new MagickImage(copy);
+        lock (_archiveSync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            ZipEntry entry = _zipFile.GetEntry(entryName) ?? throw new CwsEditorException($"Archive entry was not found: {entryName}");
+            using Stream entryStream = _zipFile.GetInputStream(entry);
+            using MemoryStream copy = new();
+            entryStream.CopyTo(copy);
+            copy.Position = 0;
+            return new MagickImage(copy);
+        }
     }
 
     private sealed record CacheItem(string Key, MagickImage Image);

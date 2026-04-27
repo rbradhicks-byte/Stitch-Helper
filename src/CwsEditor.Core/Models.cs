@@ -20,7 +20,27 @@ public sealed record CwsStrip(
     int YOffset,
     byte[]? ThumbBytes);
 
-public sealed record CwsPassthroughEntry(string EntryName, byte[] Data);
+public sealed class CwsPassthroughEntry
+{
+    private readonly Func<byte[]>? _dataFactory;
+    private byte[]? _data;
+
+    public CwsPassthroughEntry(string entryName, byte[] data)
+    {
+        EntryName = entryName;
+        _data = data;
+    }
+
+    internal CwsPassthroughEntry(string entryName, Func<byte[]> dataFactory)
+    {
+        EntryName = entryName;
+        _dataFactory = dataFactory;
+    }
+
+    public string EntryName { get; }
+
+    public byte[] Data => _data ??= (_dataFactory?.Invoke() ?? []);
+}
 
 public sealed record DepthSample(DateTimeOffset TimestampUtc, double Depth, double Orientation)
 {
@@ -35,9 +55,14 @@ public sealed record DepthSample(DateTimeOffset TimestampUtc, double Depth, doub
         }
 
         string stamp = $"{parts[0]} {parts[1]}";
+        string[] formats =
+        [
+            "dd/MM/yy HH:mm:ss.fff",
+            "dd-MM-yy HH:mm:ss.fff",
+        ];
         if (!DateTime.TryParseExact(
                 stamp,
-                "dd/MM/yy HH:mm:ss.fff",
+                formats,
                 CultureInfo.InvariantCulture,
                 DateTimeStyles.None,
                 out DateTime parsed))
@@ -211,6 +236,16 @@ public sealed class EditSession
 
     public IReadOnlyList<EditRegion> Regions => _regions;
 
+    public bool HasGeometryEdits =>
+        Math.Abs(GlobalVerticalScale - 1d) > 0.0001d ||
+        GetActiveRegions().Any(region => region.HasScaleEdit || region.IsCrop);
+
+    public bool HasToneEdits =>
+        !GlobalTone.IsIdentity ||
+        GetActiveRegions().Any(region => !region.Tone.IsIdentity);
+
+    public bool HasAnyEdits => HasGeometryEdits || HasToneEdits;
+
     public WarpMap BuildWarpMap(double sourceHeight)
     {
         string signature = BuildGeometrySignature();
@@ -233,6 +268,22 @@ public sealed class EditSession
         (includeDisabled ? _regions : GetActiveRegions())
             .OrderBy(region => region.NormalizedStart)
             .ToArray();
+
+    public bool HasEditsAffectingSourceInterval(double sourceStart, double sourceEnd)
+    {
+        if (Math.Abs(GlobalVerticalScale - 1d) > 0.0001d || !GlobalTone.IsIdentity)
+        {
+            return true;
+        }
+
+        return GetActiveRegions().Any(region =>
+            region.NormalizedStart < sourceEnd &&
+            sourceStart < region.NormalizedEnd &&
+            (region.HasScaleEdit || region.IsCrop || !region.Tone.IsIdentity));
+    }
+
+    public string BuildRenderSignature(double sourceHeight) =>
+        string.Join("|", sourceHeight.ToString("G17", CultureInfo.InvariantCulture), BuildGeometrySignature(), BuildToneSignature());
 
     public void UpsertRegion(EditRegion region)
     {
@@ -300,6 +351,28 @@ public sealed class EditSession
                 $"{(region.VerticalScale?.ToString("G17", CultureInfo.InvariantCulture) ?? "null")}");
         return string.Join("|", [scaleText, .. regionParts]);
     }
+
+    private string BuildToneSignature()
+    {
+        string globalTone = FormatTone(GlobalTone);
+        IEnumerable<string> regionParts = GetActiveRegions()
+            .Where(region => !region.Tone.IsIdentity)
+            .OrderBy(region => region.NormalizedStart)
+            .ThenBy(region => region.NormalizedEnd)
+            .Select(region =>
+                $"{region.NormalizedStart.ToString("G17", CultureInfo.InvariantCulture)}:" +
+                $"{region.NormalizedEnd.ToString("G17", CultureInfo.InvariantCulture)}:" +
+                $"{FormatTone(region.Tone)}");
+        return string.Join("|", [globalTone, .. regionParts]);
+    }
+
+    private static string FormatTone(ToneAdjustment tone) =>
+        string.Join(
+            ":",
+            tone.Brightness.ToString("G17", CultureInfo.InvariantCulture),
+            tone.Contrast.ToString("G17", CultureInfo.InvariantCulture),
+            tone.Sharpness.ToString("G17", CultureInfo.InvariantCulture),
+            tone.NormalizeEnabled ? "1" : "0");
 
     private IEnumerable<EditRegion> GetActiveRegions() => _regions.Where(region => region.IsEnabled);
 }
@@ -548,6 +621,43 @@ public sealed class CwsDocument
     public int DisplacementRegionHeight { get; }
 
     public double DisplacementOverscan { get; }
+
+    public IEnumerable<CwsStrip> GetStripsOverlapping(double sourceStart, double sourceEnd)
+    {
+        if (Strips.Count == 0 || sourceEnd <= sourceStart)
+        {
+            yield break;
+        }
+
+        int low = 0;
+        int high = Strips.Count - 1;
+        int first = Strips.Count;
+        while (low <= high)
+        {
+            int mid = low + ((high - low) / 2);
+            CwsStrip strip = Strips[mid];
+            if (strip.YOffset + strip.Height > sourceStart)
+            {
+                first = mid;
+                high = mid - 1;
+            }
+            else
+            {
+                low = mid + 1;
+            }
+        }
+
+        for (int index = first; index < Strips.Count; index++)
+        {
+            CwsStrip strip = Strips[index];
+            if (strip.YOffset >= sourceEnd)
+            {
+                yield break;
+            }
+
+            yield return strip;
+        }
+    }
 }
 
 public sealed record SaveProgress(int Completed, int Total, string Stage);

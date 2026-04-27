@@ -1,3 +1,6 @@
+using System.Globalization;
+using System.Collections.Concurrent;
+using ICSharpCode.SharpZipLib.Checksum;
 using ICSharpCode.SharpZipLib.Zip;
 using ImageMagick;
 
@@ -37,10 +40,13 @@ public static class CwsArchive
         string depthEntryName = FindRequiredEntry(entriesByName.Keys, "Depth.txt");
         string telemetryEntryName = FindRequiredEntry(entriesByName.Keys, "Telemetry.txt");
 
-        string stitchJson = await ReadTextEntryAsync(zipFile, stitchEntryName, cancellationToken);
+        byte[] stitchBytes = await ReadBinaryEntryAsync(zipFile, stitchEntryName, cancellationToken);
+        string stitchJson = System.Text.Encoding.UTF8.GetString(stitchBytes);
         StitchMetadata stitchMetadata = StitchMetadata.Parse(stitchJson);
-        string depthText = await ReadTextEntryAsync(zipFile, depthEntryName, cancellationToken);
-        string telemetryText = await ReadTextEntryAsync(zipFile, telemetryEntryName, cancellationToken);
+        byte[] depthBytes = await ReadBinaryEntryAsync(zipFile, depthEntryName, cancellationToken);
+        string depthText = System.Text.Encoding.UTF8.GetString(depthBytes);
+        byte[] telemetryBytes = await ReadBinaryEntryAsync(zipFile, telemetryEntryName, cancellationToken);
+        string telemetryText = System.Text.Encoding.UTF8.GetString(telemetryBytes);
 
         List<DepthSample> depthSamples = depthText
             .Split(["\r\n", "\n"], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
@@ -48,8 +54,10 @@ public static class CwsArchive
             .OrderBy(sample => sample.TimestampUtc)
             .ToList();
 
+        List<StripLayoutEntry> normalizedLayoutEntries = NormalizeLayoutEntries(stitchMetadata.LayoutEntries);
+
         List<CwsStrip> strips = [];
-        foreach (StripLayoutEntry layoutEntry in stitchMetadata.LayoutEntries.OrderBy(entry => entry.YOffset))
+        foreach (StripLayoutEntry layoutEntry in normalizedLayoutEntries)
         {
             cancellationToken.ThrowIfCancellationRequested();
             int index = strips.Count;
@@ -58,9 +66,6 @@ public static class CwsArchive
             string thumbEntryName = FindOptionalEntry(entriesByName.Keys, $"thumbs/{layoutEntry.ImageFileName}")
                 ?? FindOptionalEntry(entriesByName.Keys, $"thumbs/{Path.GetFileNameWithoutExtension(layoutEntry.ImageFileName)}.png")
                 ?? string.Empty;
-            byte[]? thumbBytes = string.IsNullOrEmpty(thumbEntryName)
-                ? null
-                : await ReadBinaryEntryAsync(zipFile, thumbEntryName, cancellationToken);
             strips.Add(
                 new CwsStrip(
                     index,
@@ -71,26 +76,38 @@ public static class CwsArchive
                     layoutEntry.Height,
                     layoutEntry.XOffset,
                     layoutEntry.YOffset,
-                    thumbBytes));
+                    null));
         }
 
-        int standardStripHeight = stitchMetadata.LayoutEntries.Count > 1
-            ? stitchMetadata.LayoutEntries.Take(stitchMetadata.LayoutEntries.Count - 1).Max(entry => entry.Height)
-            : stitchMetadata.LayoutEntries.FirstOrDefault()?.Height ?? 2048;
-        int stripStride = stitchMetadata.LayoutEntries.Count > 1
-            ? stitchMetadata.LayoutEntries[1].YOffset - stitchMetadata.LayoutEntries[0].YOffset
-            : standardStripHeight;
-        int thumbnailWidth = DetermineThumbnailWidth(strips);
+        int standardStripHeight = normalizedLayoutEntries.Count > 1
+            ? normalizedLayoutEntries.Take(normalizedLayoutEntries.Count - 1).Max(entry => entry.Height)
+            : normalizedLayoutEntries.FirstOrDefault()?.Height ?? 2048;
+        int stripStride = DetermineStripStride(normalizedLayoutEntries, standardStripHeight);
+        int thumbnailWidth = DetermineThumbnailWidth(zipFile, strips);
 
         Dictionary<string, CwsPassthroughEntry> passthroughEntries = new(StringComparer.OrdinalIgnoreCase);
         foreach (string entryName in entryOrder.Where(name => !name.StartsWith("images/", StringComparison.OrdinalIgnoreCase) && !name.StartsWith("thumbs/", StringComparison.OrdinalIgnoreCase) && !name.Equals(stitchEntryName, StringComparison.OrdinalIgnoreCase)))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            byte[] data = await ReadBinaryEntryAsync(zipFile, entryName, cancellationToken);
-            passthroughEntries[entryName] = new CwsPassthroughEntry(entryName, data);
+            if (string.Equals(entryName, depthEntryName, StringComparison.OrdinalIgnoreCase))
+            {
+                passthroughEntries[entryName] = new CwsPassthroughEntry(entryName, depthBytes);
+            }
+            else if (string.Equals(entryName, telemetryEntryName, StringComparison.OrdinalIgnoreCase))
+            {
+                passthroughEntries[entryName] = new CwsPassthroughEntry(entryName, telemetryBytes);
+            }
+            else
+            {
+                string capturedEntryName = entryName;
+                string capturedPath = path;
+                passthroughEntries[entryName] = new CwsPassthroughEntry(
+                    entryName,
+                    () => ReadBinaryEntryFromFile(capturedPath, capturedEntryName));
+            }
         }
 
-        int compositeWidth = stitchMetadata.LayoutEntries.FirstOrDefault()?.Width ?? strips.FirstOrDefault()?.Width ?? 1944;
+        int compositeWidth = normalizedLayoutEntries.FirstOrDefault()?.Width ?? strips.FirstOrDefault()?.Width ?? 1944;
         return new CwsDocument(
             path,
             strips,
@@ -105,15 +122,57 @@ public static class CwsArchive
             thumbnailWidth);
     }
 
+    private static List<StripLayoutEntry> NormalizeLayoutEntries(IReadOnlyList<StripLayoutEntry> layoutEntries)
+    {
+        if (layoutEntries.Count == 0)
+        {
+            return [];
+        }
+
+        int minYOffset = layoutEntries.Min(entry => entry.YOffset);
+        return layoutEntries
+            .Select(entry => entry with { YOffset = entry.YOffset - minYOffset })
+            .OrderBy(entry => entry.YOffset)
+            .ThenBy(entry => entry.ImageFileName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static int DetermineStripStride(IReadOnlyList<StripLayoutEntry> orderedLayoutEntries, int standardStripHeight)
+    {
+        if (orderedLayoutEntries.Count > 1)
+        {
+            for (int index = 1; index < orderedLayoutEntries.Count; index++)
+            {
+                int stride = orderedLayoutEntries[index].YOffset - orderedLayoutEntries[index - 1].YOffset;
+                if (stride > 0)
+                {
+                    return stride;
+                }
+            }
+        }
+
+        return Math.Max(1, standardStripHeight);
+    }
+
     public static async Task SaveEditedAsync(
         CwsDocument document,
         EditSession session,
         string outputPath,
         IProgress<SaveProgress>? progress = null,
+        CancellationToken cancellationToken = default) =>
+        await SaveEditedAsync(document, session, outputPath, CwsExportOptions.Default, progress, cancellationToken);
+
+    public static async Task SaveEditedAsync(
+        CwsDocument document,
+        EditSession session,
+        string outputPath,
+        CwsExportOptions? exportOptions,
+        IProgress<SaveProgress>? progress = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(document);
         ArgumentNullException.ThrowIfNull(session);
+        CwsExportOptions options = (exportOptions ?? CwsExportOptions.Default).Normalize();
 
         if (string.IsNullOrWhiteSpace(outputPath))
         {
@@ -147,39 +206,79 @@ public static class CwsArchive
             {
                 IsStreamOwner = false,
             };
+            using FileStream sourceStream = new(document.SourcePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using ZipFile sourceZipFile = new(sourceStream) { IsStreamOwner = false };
             zipStream.SetLevel(6);
 
             int totalSteps = document.PassthroughEntries.Count + (generatedStrips.Count * 2) + 1;
             int completed = 0;
+            using ExportRendererPool rendererPool = new(document, options.MaxDegreeOfParallelism);
 
             foreach (CwsPassthroughEntry entry in document.PassthroughEntries.Values.OrderBy(item => item.EntryName, StringComparer.OrdinalIgnoreCase))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                await WriteEntryAsync(zipStream, entry.EntryName, entry.Data, cancellationToken);
+                await CopyEntryAsync(sourceZipFile, zipStream, entry.EntryName, entry.EntryName, store: false, cancellationToken);
                 completed++;
                 progress?.Report(new SaveProgress(completed, totalSteps, $"Copied {entry.EntryName}"));
             }
 
-            using CwsRenderService renderer = new(document);
-            foreach (GeneratedStrip strip in generatedStrips)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                using MagickImage image = await renderer.RenderViewportImageAsync(session, warp, strip.YOffset, strip.Height, 1d, cancellationToken);
-                byte[] pngBytes = image.ToByteArray(MagickFormat.Png);
-                await WriteEntryAsync(zipStream, $"images/{strip.ImageFileName}", pngBytes, cancellationToken);
-                completed++;
-                progress?.Report(new SaveProgress(completed, totalSteps, $"Rendered {strip.ImageFileName}"));
+            int nextToSchedule = 0;
+            int nextToWrite = 0;
+            int maxQueuedPayloads = Math.Max(1, options.MaxDegreeOfParallelism * 2);
+            Dictionary<int, Task<ExportStripPayload>> inFlight = [];
 
-                int thumbHeight = Math.Max(1, (int)Math.Round(strip.Height * (document.ThumbnailWidth / (double)document.CompositeWidth), MidpointRounding.AwayFromZero));
-                using MagickImage thumbnail = (MagickImage)image.Clone();
-                thumbnail.Resize((uint)document.ThumbnailWidth, (uint)thumbHeight);
-                byte[] thumbBytes = thumbnail.ToByteArray(MagickFormat.Png);
-                await WriteEntryAsync(zipStream, $"thumbs/{strip.ImageFileName}", thumbBytes, cancellationToken);
-                completed++;
-                progress?.Report(new SaveProgress(completed, totalSteps, $"Rendered thumbs/{strip.ImageFileName}"));
+            void ScheduleMore()
+            {
+                while (nextToSchedule < generatedStrips.Count && inFlight.Count < maxQueuedPayloads)
+                {
+                    GeneratedStrip scheduledStrip = generatedStrips[nextToSchedule++];
+                    inFlight[scheduledStrip.Index] = Task.Run(
+                        () => BuildExportStripPayload(document, session, warp, scheduledStrip, options, rendererPool, cancellationToken),
+                        cancellationToken);
+                }
             }
 
-            await WriteEntryAsync(zipStream, "Stitch.dat", System.Text.Encoding.UTF8.GetBytes(stitchJson), cancellationToken);
+            ScheduleMore();
+            while (nextToWrite < generatedStrips.Count)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                Task<ExportStripPayload> payloadTask = inFlight[nextToWrite];
+                ExportStripPayload payload = await payloadTask;
+                inFlight.Remove(nextToWrite);
+                ScheduleMore();
+
+                string imageEntryName = $"images/{payload.Strip.ImageFileName}";
+                if (payload.SourceImageEntryName is not null)
+                {
+                    await CopyEntryAsync(sourceZipFile, zipStream, payload.SourceImageEntryName, imageEntryName, options.StorePngEntries, cancellationToken);
+                    completed++;
+                    progress?.Report(new SaveProgress(completed, totalSteps, $"Copied {payload.Strip.ImageFileName}"));
+                }
+                else
+                {
+                    await WriteEntryAsync(zipStream, imageEntryName, payload.ImagePngBytes ?? [], options.StorePngEntries, cancellationToken);
+                    completed++;
+                    progress?.Report(new SaveProgress(completed, totalSteps, $"Rendered {payload.Strip.ImageFileName}"));
+                }
+
+                string thumbEntryName = $"thumbs/{payload.Strip.ImageFileName}";
+                if (payload.SourceThumbEntryName is not null)
+                {
+                    await CopyEntryAsync(sourceZipFile, zipStream, payload.SourceThumbEntryName, thumbEntryName, options.StorePngEntries, cancellationToken);
+                    completed++;
+                    progress?.Report(new SaveProgress(completed, totalSteps, $"Copied thumbs/{payload.Strip.ImageFileName}"));
+                }
+                else
+                {
+                    await WriteEntryAsync(zipStream, thumbEntryName, payload.ThumbPngBytes ?? [], options.StorePngEntries, cancellationToken);
+                    completed++;
+                    progress?.Report(new SaveProgress(completed, totalSteps, $"Rendered thumbs/{payload.Strip.ImageFileName}"));
+                }
+
+                nextToWrite++;
+            }
+
+            await WriteEntryAsync(zipStream, "Stitch.dat", System.Text.Encoding.UTF8.GetBytes(stitchJson), store: false, cancellationToken);
             completed++;
             progress?.Report(new SaveProgress(completed, totalSteps, "Updated Stitch.dat"));
 
@@ -201,6 +300,74 @@ public static class CwsArchive
         }
 
         File.Move(tempPath, outputFullPath);
+    }
+
+    private static ExportStripPayload BuildExportStripPayload(
+        CwsDocument document,
+        EditSession session,
+        WarpMap warp,
+        GeneratedStrip strip,
+        CwsExportOptions options,
+        ExportRendererPool rendererPool,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (options.CopyUnchangedStrips &&
+            TryGetUnchangedSourceStrip(document, session, warp, strip, out CwsStrip? sourceStrip) &&
+            !string.IsNullOrWhiteSpace(sourceStrip.ThumbEntryName))
+        {
+            return ExportStripPayload.FromSource(strip, sourceStrip.ImageEntryName, sourceStrip.ThumbEntryName);
+        }
+
+        CwsRenderService renderer = rendererPool.Rent(cancellationToken);
+        try
+        {
+            using MagickImage image = renderer.RenderViewportImage(session, warp, strip.YOffset, strip.Height, 1d, cancellationToken);
+            byte[] imageBytes = EncodePng(image, options);
+
+            int thumbHeight = Math.Max(1, (int)Math.Round(strip.Height * (document.ThumbnailWidth / (double)document.CompositeWidth), MidpointRounding.AwayFromZero));
+            using MagickImage thumbnail = (MagickImage)image.Clone();
+            thumbnail.Resize((uint)document.ThumbnailWidth, (uint)thumbHeight);
+            byte[] thumbBytes = EncodePng(thumbnail, options);
+
+            return ExportStripPayload.FromBytes(strip, imageBytes, thumbBytes);
+        }
+        finally
+        {
+            rendererPool.Return(renderer);
+        }
+    }
+
+    private static bool TryGetUnchangedSourceStrip(
+        CwsDocument document,
+        EditSession session,
+        WarpMap warp,
+        GeneratedStrip generatedStrip,
+        out CwsStrip sourceStrip)
+    {
+        sourceStrip = null!;
+        double displayStart = generatedStrip.YOffset;
+        double displayEnd = generatedStrip.YOffset + generatedStrip.Height;
+        double sourceStart = warp.Inverse(displayStart);
+        double sourceEnd = warp.Inverse(displayEnd);
+        if (Math.Abs(sourceStart - displayStart) > 0.0001d ||
+            Math.Abs(sourceEnd - displayEnd) > 0.0001d ||
+            session.HasEditsAffectingSourceInterval(sourceStart, sourceEnd))
+        {
+            return false;
+        }
+
+        sourceStrip = document.Strips.FirstOrDefault(strip =>
+            strip.YOffset == generatedStrip.YOffset &&
+            strip.Height == generatedStrip.Height) ?? null!;
+        return sourceStrip is not null;
+    }
+
+    private static byte[] EncodePng(MagickImage image, CwsExportOptions options)
+    {
+        image.Strip();
+        image.Settings.SetDefine(MagickFormat.Png, "compression-level", options.PngCompressionLevel.ToString(CultureInfo.InvariantCulture));
+        return image.ToByteArray(MagickFormat.Png);
     }
 
     private static List<GeneratedStrip> BuildGeneratedStripPlan(CwsDocument document, int totalDisplayHeight)
@@ -257,16 +424,40 @@ public static class CwsArchive
         return results;
     }
 
-    private static async Task WriteEntryAsync(ZipOutputStream zipStream, string entryName, byte[] data, CancellationToken cancellationToken)
+    private static async Task WriteEntryAsync(ZipOutputStream zipStream, string entryName, byte[] data, bool store, CancellationToken cancellationToken)
     {
         ZipEntry entry = new(entryName)
         {
             DateTime = DateTime.Now,
             Size = data.Length,
         };
+
+        if (store)
+        {
+            Crc32 crc = new();
+            crc.Update(data);
+            entry.Crc = crc.Value;
+            entry.CompressionMethod = ICSharpCode.SharpZipLib.Zip.CompressionMethod.Stored;
+        }
+
         zipStream.PutNextEntry(entry);
         await zipStream.WriteAsync(data, cancellationToken);
         zipStream.CloseEntry();
+    }
+
+    private static async Task CopyEntryAsync(
+        ZipFile sourceZipFile,
+        ZipOutputStream outputZipStream,
+        string sourceEntryName,
+        string outputEntryName,
+        bool store,
+        CancellationToken cancellationToken)
+    {
+        ZipEntry sourceEntry = sourceZipFile.GetEntry(sourceEntryName) ?? throw new CwsEditorException($"Archive entry was not found: {sourceEntryName}");
+        using Stream sourceStream = sourceZipFile.GetInputStream(sourceEntry);
+        using MemoryStream buffer = new();
+        await sourceStream.CopyToAsync(buffer, cancellationToken);
+        await WriteEntryAsync(outputZipStream, outputEntryName, buffer.ToArray(), store, cancellationToken);
     }
 
     private static string FindRequiredEntry(IEnumerable<string> names, string expectedName) =>
@@ -274,12 +465,6 @@ public static class CwsArchive
 
     private static string? FindOptionalEntry(IEnumerable<string> names, string expectedName) =>
         names.FirstOrDefault(name => string.Equals(name, expectedName, StringComparison.OrdinalIgnoreCase));
-
-    private static async Task<string> ReadTextEntryAsync(ZipFile zipFile, string entryName, CancellationToken cancellationToken)
-    {
-        byte[] data = await ReadBinaryEntryAsync(zipFile, entryName, cancellationToken);
-        return System.Text.Encoding.UTF8.GetString(data);
-    }
 
     private static async Task<byte[]> ReadBinaryEntryAsync(ZipFile zipFile, string entryName, CancellationToken cancellationToken)
     {
@@ -290,16 +475,37 @@ public static class CwsArchive
         return buffer.ToArray();
     }
 
-    private static int DetermineThumbnailWidth(IReadOnlyList<CwsStrip> strips)
+    internal static byte[] ReadBinaryEntryFromFile(string archivePath, string entryName)
+    {
+        using FileStream stream = new(archivePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        using ZipFile zipFile = new(stream) { IsStreamOwner = false };
+        ZipEntry entry = zipFile.GetEntry(entryName) ?? throw new CwsEditorException($"Archive entry was not found: {entryName}");
+        using Stream entryStream = zipFile.GetInputStream(entry);
+        using MemoryStream buffer = new();
+        entryStream.CopyTo(buffer);
+        return buffer.ToArray();
+    }
+
+    private static int DetermineThumbnailWidth(ZipFile zipFile, IReadOnlyList<CwsStrip> strips)
     {
         foreach (CwsStrip strip in strips)
         {
-            if (strip.ThumbBytes is null)
+            if (string.IsNullOrWhiteSpace(strip.ThumbEntryName))
             {
                 continue;
             }
 
-            using MagickImage thumbnail = new(strip.ThumbBytes);
+            ZipEntry? entry = zipFile.GetEntry(strip.ThumbEntryName);
+            if (entry is null)
+            {
+                continue;
+            }
+
+            using Stream entryStream = zipFile.GetInputStream(entry);
+            using MemoryStream buffer = new();
+            entryStream.CopyTo(buffer);
+            buffer.Position = 0;
+            using MagickImage thumbnail = new(buffer);
             return (int)thumbnail.Width;
         }
 
@@ -307,4 +513,62 @@ public static class CwsArchive
     }
 
     private sealed record GeneratedStrip(int Index, string ImageFileName, int YOffset, int Height);
+
+    private sealed record ExportStripPayload(
+        GeneratedStrip Strip,
+        byte[]? ImagePngBytes,
+        byte[]? ThumbPngBytes,
+        string? SourceImageEntryName,
+        string? SourceThumbEntryName)
+    {
+        public static ExportStripPayload FromBytes(GeneratedStrip strip, byte[] imagePngBytes, byte[] thumbPngBytes) =>
+            new(strip, imagePngBytes, thumbPngBytes, null, null);
+
+        public static ExportStripPayload FromSource(GeneratedStrip strip, string imageEntryName, string thumbEntryName) =>
+            new(strip, null, null, imageEntryName, thumbEntryName);
+    }
+
+    private sealed class ExportRendererPool : IDisposable
+    {
+        private readonly ConcurrentBag<CwsRenderService> _renderers = [];
+        private readonly SemaphoreSlim _semaphore;
+
+        public ExportRendererPool(CwsDocument document, int count)
+        {
+            int safeCount = Math.Max(1, count);
+            _semaphore = new SemaphoreSlim(safeCount, safeCount);
+            for (int index = 0; index < safeCount; index++)
+            {
+                _renderers.Add(new CwsRenderService(document, stripCacheCapacity: 10, renderTileCacheByteLimit: 0));
+            }
+        }
+
+        public CwsRenderService Rent(CancellationToken cancellationToken)
+        {
+            _semaphore.Wait(cancellationToken);
+            if (_renderers.TryTake(out CwsRenderService? renderer))
+            {
+                return renderer;
+            }
+
+            _semaphore.Release();
+            throw new CwsEditorException("No export renderer was available.");
+        }
+
+        public void Return(CwsRenderService renderer)
+        {
+            _renderers.Add(renderer);
+            _semaphore.Release();
+        }
+
+        public void Dispose()
+        {
+            while (_renderers.TryTake(out CwsRenderService? renderer))
+            {
+                renderer.Dispose();
+            }
+
+            _semaphore.Dispose();
+        }
+    }
 }
