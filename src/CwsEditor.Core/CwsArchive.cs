@@ -54,9 +54,10 @@ public static class CwsArchive
             .OrderBy(sample => sample.TimestampUtc)
             .ToList();
 
-        LayoutCoordinateTransform coordinateTransform = LayoutCoordinateTransform.FromLayout(stitchMetadata.LayoutEntries);
+        int standardStripHeight = DetermineStandardStripHeight(stitchMetadata.LayoutEntries);
+        LayoutCoordinateTransform coordinateTransform = LayoutCoordinateTransform.FromLayout(stitchMetadata.LayoutEntries, standardStripHeight);
         List<StripLayoutEntry> normalizedLayoutEntries = NormalizeLayoutEntries(stitchMetadata.LayoutEntries, coordinateTransform);
-        IReadOnlyList<DisplacementSample> normalizedDisplacements = NormalizeDisplacements(stitchMetadata.Displacements, coordinateTransform);
+        IReadOnlyList<DisplacementSample> normalizedDisplacements = NormalizeDisplacements(stitchMetadata.Displacements);
 
         List<CwsStrip> strips = [];
         foreach (StripLayoutEntry layoutEntry in normalizedLayoutEntries)
@@ -81,10 +82,7 @@ public static class CwsArchive
                     null));
         }
 
-        int standardStripHeight = normalizedLayoutEntries.Count > 1
-            ? normalizedLayoutEntries.Take(normalizedLayoutEntries.Count - 1).Max(entry => entry.Height)
-            : normalizedLayoutEntries.FirstOrDefault()?.Height ?? 2048;
-        int stripStride = DetermineStripStride(normalizedLayoutEntries, standardStripHeight);
+        int stripStride = DetermineStripStride(stitchMetadata.LayoutEntries, standardStripHeight);
         int thumbnailWidth = DetermineThumbnailWidth(zipFile, strips);
 
         Dictionary<string, CwsPassthroughEntry> passthroughEntries = new(StringComparer.OrdinalIgnoreCase);
@@ -146,14 +144,26 @@ public static class CwsArchive
             .ToList();
     }
 
-    private static IReadOnlyList<DisplacementSample> NormalizeDisplacements(
-        IReadOnlyList<DisplacementSample> displacements,
-        LayoutCoordinateTransform coordinateTransform) =>
-        displacements
-            .Select(sample => sample with { RegionY = coordinateTransform.Normalize(sample.RegionY) })
+    private static IReadOnlyList<DisplacementSample> NormalizeDisplacements(IReadOnlyList<DisplacementSample> displacements)
+    {
+        if (displacements.Count == 0)
+        {
+            return [];
+        }
+
+        double displacementAnchor = displacements.Min(sample => sample.RegionY);
+
+        return displacements
+            .Select(sample => sample with { RegionY = sample.RegionY - displacementAnchor })
             .OrderBy(sample => sample.RegionY)
             .ThenBy(sample => sample.JobTimeUtc)
             .ToArray();
+    }
+
+    private static int DetermineStandardStripHeight(IReadOnlyList<StripLayoutEntry> layoutEntries) =>
+        layoutEntries.Count > 1
+            ? layoutEntries.Take(layoutEntries.Count - 1).Max(entry => entry.Height)
+            : layoutEntries.FirstOrDefault()?.Height ?? 2048;
 
     private static int DetermineStripStride(IReadOnlyList<StripLayoutEntry> orderedLayoutEntries, int standardStripHeight)
     {
@@ -161,7 +171,7 @@ public static class CwsArchive
         {
             for (int index = 1; index < orderedLayoutEntries.Count; index++)
             {
-                int stride = orderedLayoutEntries[index].YOffset - orderedLayoutEntries[index - 1].YOffset;
+                int stride = Math.Abs(orderedLayoutEntries[index].YOffset - orderedLayoutEntries[index - 1].YOffset);
                 if (stride > 0)
                 {
                     return stride;
@@ -172,9 +182,9 @@ public static class CwsArchive
         return Math.Max(1, standardStripHeight);
     }
 
-    private sealed record LayoutCoordinateTransform(bool InvertYOffset, double MinYOffset, double MaxYOffset)
+    private sealed record LayoutCoordinateTransform(bool IsDescending, double MinYOffset, double TopPartialCompaction)
     {
-        public static LayoutCoordinateTransform FromLayout(IReadOnlyList<StripLayoutEntry> layoutEntries)
+        public static LayoutCoordinateTransform FromLayout(IReadOnlyList<StripLayoutEntry> layoutEntries, int standardStripHeight)
         {
             if (layoutEntries.Count == 0)
             {
@@ -196,21 +206,35 @@ public static class CwsArchive
                 }
             }
 
-            bool invertYOffset = negativeDeltas > positiveDeltas ||
+            bool isDescending = negativeDeltas > positiveDeltas ||
                 (negativeDeltas == positiveDeltas &&
                  layoutEntries.Count > 1 &&
                  layoutEntries[^1].YOffset < layoutEntries[0].YOffset);
 
+            int minYOffset = layoutEntries.Min(entry => entry.YOffset);
+            StripLayoutEntry topVisualEntry = layoutEntries
+                .OrderBy(entry => entry.YOffset)
+                .First();
+            double topPartialCompaction = isDescending
+                ? Math.Max(0d, standardStripHeight - topVisualEntry.Height)
+                : 0d;
+
             return new LayoutCoordinateTransform(
-                invertYOffset,
-                layoutEntries.Min(entry => entry.YOffset),
-                layoutEntries.Max(entry => entry.YOffset));
+                isDescending,
+                minYOffset,
+                topPartialCompaction);
         }
 
-        public double Normalize(double rawYOffset) =>
-            InvertYOffset
-                ? MaxYOffset - rawYOffset
-                : rawYOffset - MinYOffset;
+        public double Normalize(double rawYOffset)
+        {
+            double normalized = rawYOffset - MinYOffset;
+            if (IsDescending && normalized > 0d)
+            {
+                normalized = Math.Max(0d, normalized - TopPartialCompaction);
+            }
+
+            return normalized;
+        }
 
         public int NormalizeOffset(int rawYOffset) =>
             (int)Math.Round(Normalize(rawYOffset), MidpointRounding.AwayFromZero);

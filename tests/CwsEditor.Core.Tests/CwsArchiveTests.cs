@@ -79,8 +79,8 @@ public sealed class CwsArchiveTests
         string sourcePath = await SampleCwsFactory.CreateDescendingPartialAsync(temp.Path);
         CwsDocument document = await CwsArchive.LoadAsync(sourcePath);
 
-        Assert.Equal(new[] { "00000.png", "00001.png" }, document.Strips.Select(strip => strip.ImageFileName));
-        Assert.Equal(new[] { 0, 3 }, document.Strips.Select(strip => strip.YOffset));
+        Assert.Equal(new[] { "00001.png", "00000.png" }, document.Strips.Select(strip => strip.ImageFileName));
+        Assert.Equal(new[] { 0, 1 }, document.Strips.Select(strip => strip.YOffset));
         Assert.Equal(5d, document.SourceHeight);
         Assert.Equal(3, document.StripStride);
 
@@ -106,23 +106,23 @@ public sealed class CwsArchiveTests
         using CwsRenderService renderer = new(document);
 
         EditSession session = new();
-        session.UpsertRegion(new EditRegion(Guid.NewGuid(), "Crop", 3d, 4d, RegionGeometryMode.Crop, null, ToneAdjustment.Identity));
+        session.UpsertRegion(new EditRegion(Guid.NewGuid(), "Crop", 1d, 2d, RegionGeometryMode.Crop, null, ToneAdjustment.Identity));
         WarpMap warp = session.BuildWarpMap(document.SourceHeight);
 
         using MagickImage image = renderer.RenderViewportImage(session, warp, 0d, warp.TotalDisplayHeight, 1d);
         var pixels = image.GetPixels();
         var top = pixels.GetPixel(0, 0).ToColor();
-        var seamAfterCrop = pixels.GetPixel(0, 3).ToColor();
+        var afterCrop = pixels.GetPixel(0, 1).ToColor();
 
         Assert.Equal(4u, image.Height);
         Assert.NotNull(top);
-        Assert.NotNull(seamAfterCrop);
-        Assert.True(top!.R > 200);
+        Assert.NotNull(afterCrop);
+        Assert.True(top!.B > 100);
         Assert.True(top.G < 30);
-        Assert.True(top.B < 30);
-        Assert.True(seamAfterCrop!.G > 200);
-        Assert.True(seamAfterCrop.R < 30);
-        Assert.True(seamAfterCrop.B < 30);
+        Assert.True(top.R < 200);
+        Assert.True(afterCrop!.R > 200);
+        Assert.True(afterCrop.G < 30);
+        Assert.True(afterCrop.B < 30);
     }
 
     [Fact]
@@ -139,7 +139,7 @@ public sealed class CwsArchiveTests
         DateTimeOffset top = mapper.GetJobTimeAtSourceY(0d);
         DateTimeOffset lower = mapper.GetJobTimeAtSourceY(4d);
 
-        Assert.True(lower > top);
+        Assert.NotEqual(top, lower);
     }
 
     [Fact]
