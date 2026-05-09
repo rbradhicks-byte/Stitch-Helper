@@ -54,7 +54,9 @@ public static class CwsArchive
             .OrderBy(sample => sample.TimestampUtc)
             .ToList();
 
-        List<StripLayoutEntry> normalizedLayoutEntries = NormalizeLayoutEntries(stitchMetadata.LayoutEntries);
+        LayoutCoordinateTransform coordinateTransform = LayoutCoordinateTransform.FromLayout(stitchMetadata.LayoutEntries);
+        List<StripLayoutEntry> normalizedLayoutEntries = NormalizeLayoutEntries(stitchMetadata.LayoutEntries, coordinateTransform);
+        IReadOnlyList<DisplacementSample> normalizedDisplacements = NormalizeDisplacements(stitchMetadata.Displacements, coordinateTransform);
 
         List<CwsStrip> strips = [];
         foreach (StripLayoutEntry layoutEntry in normalizedLayoutEntries)
@@ -116,26 +118,42 @@ public static class CwsArchive
             passthroughEntries,
             entryOrder,
             stitchMetadata,
+            normalizedDisplacements,
             compositeWidth,
             standardStripHeight,
             stripStride,
             thumbnailWidth);
     }
 
-    private static List<StripLayoutEntry> NormalizeLayoutEntries(IReadOnlyList<StripLayoutEntry> layoutEntries)
+    private static List<StripLayoutEntry> NormalizeLayoutEntries(
+        IReadOnlyList<StripLayoutEntry> layoutEntries,
+        LayoutCoordinateTransform coordinateTransform)
     {
         if (layoutEntries.Count == 0)
         {
             return [];
         }
 
-        int minYOffset = layoutEntries.Min(entry => entry.YOffset);
         return layoutEntries
-            .Select(entry => entry with { YOffset = entry.YOffset - minYOffset })
-            .OrderBy(entry => entry.YOffset)
-            .ThenBy(entry => entry.ImageFileName, StringComparer.OrdinalIgnoreCase)
+            .Select((entry, index) => new
+            {
+                Entry = entry with { YOffset = coordinateTransform.NormalizeOffset(entry.YOffset) },
+                Index = index,
+            })
+            .OrderBy(item => item.Entry.YOffset)
+            .ThenBy(item => item.Index)
+            .Select(item => item.Entry)
             .ToList();
     }
+
+    private static IReadOnlyList<DisplacementSample> NormalizeDisplacements(
+        IReadOnlyList<DisplacementSample> displacements,
+        LayoutCoordinateTransform coordinateTransform) =>
+        displacements
+            .Select(sample => sample with { RegionY = coordinateTransform.Normalize(sample.RegionY) })
+            .OrderBy(sample => sample.RegionY)
+            .ThenBy(sample => sample.JobTimeUtc)
+            .ToArray();
 
     private static int DetermineStripStride(IReadOnlyList<StripLayoutEntry> orderedLayoutEntries, int standardStripHeight)
     {
@@ -152,6 +170,50 @@ public static class CwsArchive
         }
 
         return Math.Max(1, standardStripHeight);
+    }
+
+    private sealed record LayoutCoordinateTransform(bool InvertYOffset, double MinYOffset, double MaxYOffset)
+    {
+        public static LayoutCoordinateTransform FromLayout(IReadOnlyList<StripLayoutEntry> layoutEntries)
+        {
+            if (layoutEntries.Count == 0)
+            {
+                return new LayoutCoordinateTransform(false, 0d, 0d);
+            }
+
+            int positiveDeltas = 0;
+            int negativeDeltas = 0;
+            for (int index = 1; index < layoutEntries.Count; index++)
+            {
+                int delta = layoutEntries[index].YOffset - layoutEntries[index - 1].YOffset;
+                if (delta > 0)
+                {
+                    positiveDeltas++;
+                }
+                else if (delta < 0)
+                {
+                    negativeDeltas++;
+                }
+            }
+
+            bool invertYOffset = negativeDeltas > positiveDeltas ||
+                (negativeDeltas == positiveDeltas &&
+                 layoutEntries.Count > 1 &&
+                 layoutEntries[^1].YOffset < layoutEntries[0].YOffset);
+
+            return new LayoutCoordinateTransform(
+                invertYOffset,
+                layoutEntries.Min(entry => entry.YOffset),
+                layoutEntries.Max(entry => entry.YOffset));
+        }
+
+        public double Normalize(double rawYOffset) =>
+            InvertYOffset
+                ? MaxYOffset - rawYOffset
+                : rawYOffset - MinYOffset;
+
+        public int NormalizeOffset(int rawYOffset) =>
+            (int)Math.Round(Normalize(rawYOffset), MidpointRounding.AwayFromZero);
     }
 
     public static async Task SaveEditedAsync(

@@ -566,6 +566,7 @@ public sealed class CwsDocument
         IReadOnlyDictionary<string, CwsPassthroughEntry> passthroughEntries,
         IReadOnlyList<string> entryOrder,
         StitchMetadata stitchMetadata,
+        IReadOnlyList<DisplacementSample> displacements,
         int compositeWidth,
         int standardStripHeight,
         int stripStride,
@@ -578,6 +579,7 @@ public sealed class CwsDocument
         PassthroughEntries = passthroughEntries;
         EntryOrder = entryOrder;
         StitchMetadata = stitchMetadata;
+        Displacements = displacements;
         CompositeWidth = compositeWidth;
         StandardStripHeight = standardStripHeight;
         StripStride = stripStride;
@@ -585,9 +587,12 @@ public sealed class CwsDocument
         ThumbnailWidth = thumbnailWidth;
 
         SourceHeight = Strips.Count == 0 ? 0d : Strips.Max(strip => strip.YOffset + strip.Height);
-        DisplacementStride = StitchMetadata.DisplacementStride;
-        DisplacementRegionHeight = StitchMetadata.DisplacementRegionHeight;
-        DisplacementOverscan = StitchMetadata.DisplacementOverscan;
+        DisplacementStride = DetermineDisplacementStride(Displacements);
+        DisplacementRegionHeight = Displacements.Count > 0
+            ? (int)Math.Round(Displacements[0].RegionHeight, MidpointRounding.AwayFromZero)
+            : StitchMetadata.DisplacementRegionHeight;
+        double maxDisplacementY = Displacements.Count == 0 ? 0d : Displacements.Max(sample => sample.RegionY);
+        DisplacementOverscan = Math.Max(0d, maxDisplacementY - SourceHeight);
     }
 
     public string SourcePath { get; }
@@ -603,6 +608,8 @@ public sealed class CwsDocument
     public IReadOnlyList<string> EntryOrder { get; }
 
     public StitchMetadata StitchMetadata { get; }
+
+    public IReadOnlyList<DisplacementSample> Displacements { get; }
 
     public int CompositeWidth { get; }
 
@@ -657,6 +664,39 @@ public sealed class CwsDocument
 
             yield return strip;
         }
+    }
+
+    private static int DetermineDisplacementStride(IReadOnlyList<DisplacementSample> displacements)
+    {
+        if (displacements.Count < 2)
+        {
+            return 5;
+        }
+
+        double[] orderedRegionYs = displacements
+            .Select(sample => sample.RegionY)
+            .OrderBy(value => value)
+            .ToArray();
+        List<int> deltas = [];
+        for (int index = 1; index < orderedRegionYs.Length; index++)
+        {
+            double delta = orderedRegionYs[index] - orderedRegionYs[index - 1];
+            if (delta <= 0.0001d)
+            {
+                continue;
+            }
+
+            deltas.Add(Math.Max(1, (int)Math.Round(delta, MidpointRounding.AwayFromZero)));
+        }
+
+        return deltas.Count == 0
+            ? 5
+            : deltas
+                .GroupBy(delta => delta)
+                .OrderByDescending(group => group.Count())
+                .ThenBy(group => group.Key)
+                .First()
+                .Key;
     }
 }
 

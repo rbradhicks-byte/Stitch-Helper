@@ -73,6 +73,76 @@ public sealed class CwsArchiveTests
     }
 
     [Fact]
+    public async Task LoadAsyncNormalizesDescendingPartialLayoutWithoutArtificialGap()
+    {
+        using TempDirectory temp = new();
+        string sourcePath = await SampleCwsFactory.CreateDescendingPartialAsync(temp.Path);
+        CwsDocument document = await CwsArchive.LoadAsync(sourcePath);
+
+        Assert.Equal(new[] { "00000.png", "00001.png" }, document.Strips.Select(strip => strip.ImageFileName));
+        Assert.Equal(new[] { 0, 3 }, document.Strips.Select(strip => strip.YOffset));
+        Assert.Equal(5d, document.SourceHeight);
+        Assert.Equal(3, document.StripStride);
+
+        using CwsRenderService renderer = new(document);
+        using MagickImage image = renderer.RenderViewportImage(new EditSession(), new EditSession().BuildWarpMap(document.SourceHeight), 0d, document.SourceHeight, 1d);
+        var pixels = image.GetPixels();
+
+        Assert.Equal(5u, image.Height);
+        for (int y = 0; y < image.Height; y++)
+        {
+            var color = pixels.GetPixel(0, y).ToColor();
+            Assert.NotNull(color);
+            Assert.True(color!.A > 0, $"Row {y} was transparent, indicating an artificial layout gap.");
+        }
+    }
+
+    [Fact]
+    public async Task CropOnDescendingPartialLayoutRemovesSelectedLowerInterval()
+    {
+        using TempDirectory temp = new();
+        string sourcePath = await SampleCwsFactory.CreateDescendingPartialAsync(temp.Path);
+        CwsDocument document = await CwsArchive.LoadAsync(sourcePath);
+        using CwsRenderService renderer = new(document);
+
+        EditSession session = new();
+        session.UpsertRegion(new EditRegion(Guid.NewGuid(), "Crop", 3d, 4d, RegionGeometryMode.Crop, null, ToneAdjustment.Identity));
+        WarpMap warp = session.BuildWarpMap(document.SourceHeight);
+
+        using MagickImage image = renderer.RenderViewportImage(session, warp, 0d, warp.TotalDisplayHeight, 1d);
+        var pixels = image.GetPixels();
+        var top = pixels.GetPixel(0, 0).ToColor();
+        var seamAfterCrop = pixels.GetPixel(0, 3).ToColor();
+
+        Assert.Equal(4u, image.Height);
+        Assert.NotNull(top);
+        Assert.NotNull(seamAfterCrop);
+        Assert.True(top!.R > 200);
+        Assert.True(top.G < 30);
+        Assert.True(top.B < 30);
+        Assert.True(seamAfterCrop!.G > 200);
+        Assert.True(seamAfterCrop.R < 30);
+        Assert.True(seamAfterCrop.B < 30);
+    }
+
+    [Fact]
+    public async Task DepthMapperUsesNormalizedNegativeDisplacements()
+    {
+        using TempDirectory temp = new();
+        string sourcePath = await SampleCwsFactory.CreateDescendingPartialAsync(temp.Path);
+        CwsDocument document = await CwsArchive.LoadAsync(sourcePath);
+        DepthMapper mapper = new(document);
+
+        Assert.Equal(1, document.DisplacementStride);
+        Assert.Contains(document.Displacements, sample => Math.Abs(sample.RegionY - 4d) < 0.0001d);
+
+        DateTimeOffset top = mapper.GetJobTimeAtSourceY(0d);
+        DateTimeOffset lower = mapper.GetJobTimeAtSourceY(4d);
+
+        Assert.True(lower > top);
+    }
+
+    [Fact]
     public async Task RenderViewportUsesSourceStrips()
     {
         using TempDirectory temp = new();
@@ -314,9 +384,53 @@ public sealed class CwsArchiveTests
             return path;
         }
 
+        public static async Task<string> CreateDescendingPartialAsync(string directory)
+        {
+            Directory.CreateDirectory(directory);
+            string path = Path.Combine(directory, "descending-partial.cws");
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+
+            using FileStream stream = new(path, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.ReadWrite);
+            using ZipArchive archive = new(stream, ZipArchiveMode.Create, leaveOpen: false);
+
+            await WriteEntryAsync(archive, "VersionInfo.txt", "1.1");
+            await WriteEntryAsync(archive, "Depth.txt",
+                """
+                15/04/26 12:00:00.000 0.000 10.0
+                15/04/26 12:00:01.000 1.000 20.0
+                15/04/26 12:00:02.000 2.000 30.0
+                15/04/26 12:00:03.000 3.000 40.0
+                15/04/26 12:00:04.000 4.000 50.0
+                """.ReplaceLineEndings("\n"));
+            await WriteEntryAsync(archive, "Telemetry.txt", "Version=1\nTelemetry Sources\n");
+            await WriteEntryAsync(archive, "Source.stitchproj2", "stub");
+            await WriteEntryAsync(archive, "images/00000.png", CreateSolidPng(MagickColors.Red, 6, 4));
+            await WriteEntryAsync(archive, "images/00001.png", CreateRowsPng([MagickColors.Blue, MagickColors.Lime], 6));
+            await WriteEntryAsync(archive, "thumbs/00000.png", CreateSolidPng(MagickColors.Red, 3, 2));
+            await WriteEntryAsync(archive, "thumbs/00001.png", CreateRowsPng([MagickColors.Blue, MagickColors.Lime], 3));
+            await WriteEntryAsync(archive, "Stitch.dat", BuildDescendingPartialStitchJson());
+
+            return path;
+        }
+
         private static byte[] CreateSolidPng(IMagickColor<byte> color, uint width, uint height)
         {
             using MagickImage image = new(color, width, height);
+            return image.ToByteArray(MagickFormat.Png);
+        }
+
+        private static byte[] CreateRowsPng(IReadOnlyList<IMagickColor<byte>> rowColors, uint width)
+        {
+            using MagickImage image = new(MagickColors.Transparent, width, (uint)rowColors.Count);
+            for (int y = 0; y < rowColors.Count; y++)
+            {
+                using MagickImage row = new(rowColors[y], width, 1);
+                image.Composite(row, 0, y, CompositeOperator.Over);
+            }
+
             return image.ToByteArray(MagickFormat.Png);
         }
 
@@ -375,6 +489,39 @@ public sealed class CwsArchiveTests
                 .Replace("__FIRST_Y_OFFSET__", firstYOffset, StringComparison.Ordinal)
                 .Replace("__SECOND_Y_OFFSET__", secondYOffset, StringComparison.Ordinal);
         }
+
+        private static string BuildDescendingPartialStitchJson() =>
+            """
+            {"layout":[
+            {"image":"00000.png","width":6,"height":4,"x offset":0,"y offset":0},
+            {"image":"00001.png","width":6,"height":2,"x offset":0,"y offset":-3}
+            ],
+            "attributes":[],
+            "highlights":[],
+            "displacements":[
+            {"region x":0.0,"region y":0.0,"region width":6.0,"region height":2.0,"job time":"2026-04-15T12:00:00.000Z","displacement x":0.0,"displacement y":0.0},
+            {"region x":0.0,"region y":0.0,"region width":6.0,"region height":2.0,"job time":"2026-04-15T12:00:00.100Z","displacement x":0.0,"displacement y":0.0},
+            {"region x":0.0,"region y":-1.0,"region width":6.0,"region height":2.0,"job time":"2026-04-15T12:00:01.000Z","displacement x":0.0,"displacement y":-1.0},
+            {"region x":0.0,"region y":-2.0,"region width":6.0,"region height":2.0,"job time":"2026-04-15T12:00:02.000Z","displacement x":0.0,"displacement y":-1.0},
+            {"region x":0.0,"region y":-3.0,"region width":6.0,"region height":2.0,"job time":"2026-04-15T12:00:03.000Z","displacement x":0.0,"displacement y":-1.0},
+            {"region x":0.0,"region y":-4.0,"region width":6.0,"region height":2.0,"job time":"2026-04-15T12:00:04.000Z","displacement x":0.0,"displacement y":-1.0}
+            ],
+            "debug":{"movement":[
+            {"x":0.0,"y":0.0},
+            {"x":0.0,"y":0.0},
+            {"x":0.0,"y":-1.0},
+            {"x":0.0,"y":-1.0},
+            {"x":0.0,"y":-1.0},
+            {"x":0.0,"y":-1.0}
+            ],"cumulative":[
+            {"x":0.0,"y":0.0},
+            {"x":0.0,"y":0.0},
+            {"x":0.0,"y":-1.0},
+            {"x":0.0,"y":-2.0},
+            {"x":0.0,"y":-3.0},
+            {"x":0.0,"y":-4.0}
+            ],"time taken":"00:00:00","total frames":0,"frames per second":0.0}}
+            """.ReplaceLineEndings(string.Empty);
     }
 
     private static async Task<JsonObject> ReadStitchJsonAsync(string cwsPath)

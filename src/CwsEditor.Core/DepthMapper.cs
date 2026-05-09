@@ -8,7 +8,7 @@ public sealed class DepthMapper
     public DepthMapper(CwsDocument document)
     {
         _depthSamples = document.DepthSamples.OrderBy(sample => sample.TimestampUtc).ToArray();
-        _displacements = document.StitchMetadata.Displacements.OrderBy(sample => sample.RegionY).ToArray();
+        _displacements = document.Displacements.OrderBy(sample => sample.RegionY).ThenBy(sample => sample.JobTimeUtc).ToArray();
     }
 
     public DateTimeOffset GetJobTimeAtSourceY(double sourceY)
