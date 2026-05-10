@@ -11,6 +11,10 @@
         MinHeight="900"
         MinWidth="1400"
         Background="{StaticResource AppBackgroundBrush}"
+        AllowDrop="True"
+        DragEnter="Window_DragOver"
+        DragOver="Window_DragOver"
+        Drop="Window_Drop"
         Closed="Window_Closed">
     <Window.Resources>
         <Style x:Key="ToolbarCaptionStyle" TargetType="TextBlock">

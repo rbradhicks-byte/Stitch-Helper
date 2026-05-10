@@ -11,7 +11,34 @@ public partial class App : Application
     {
         DispatcherUnhandledException += OnDispatcherUnhandledException;
         base.OnStartup(e);
+
+        string? cwsPath = FindStartupCwsPath(e.Args);
+        MainWindow window = new();
+        MainWindow = window;
+        if (!string.IsNullOrWhiteSpace(cwsPath))
+        {
+            window.Loaded += async (_, _) => await window.LoadDocumentFromPathAsync(cwsPath);
+        }
+
+        window.Show();
     }
+
+    private static string? FindStartupCwsPath(string[] args)
+    {
+        string? directPath = args.FirstOrDefault(IsCwsFilePath);
+        if (!string.IsNullOrWhiteSpace(directPath))
+        {
+            return directPath;
+        }
+
+        string joinedPath = string.Join(" ", args).Trim().Trim('"');
+        return IsCwsFilePath(joinedPath) ? joinedPath : null;
+    }
+
+    private static bool IsCwsFilePath(string? path) =>
+        !string.IsNullOrWhiteSpace(path) &&
+        string.Equals(Path.GetExtension(path), ".cws", StringComparison.OrdinalIgnoreCase) &&
+        File.Exists(path);
 
     private void OnDispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)
     {

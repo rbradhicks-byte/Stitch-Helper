@@ -90,6 +90,17 @@ public partial class MainWindow : Window
         ResetExportProgress();
     }
 
+    public async Task LoadDocumentFromPathAsync(string path)
+    {
+        if (!IsCwsPath(path) || !File.Exists(path))
+        {
+            MessageBox.Show(this, "Drop or open a valid .cws file.", "Invalid CWS file", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        await LoadDocumentAsync(path);
+    }
+
     private async void OpenButton_Click(object sender, RoutedEventArgs e)
     {
         OpenFileDialog dialog = new()
@@ -100,7 +111,22 @@ public partial class MainWindow : Window
 
         if (dialog.ShowDialog(this) == true)
         {
-            await LoadDocumentAsync(dialog.FileName);
+            await LoadDocumentFromPathAsync(dialog.FileName);
+        }
+    }
+
+    private void Window_DragOver(object sender, DragEventArgs e)
+    {
+        e.Effects = TryGetDroppedCwsPath(e.Data, out _) ? DragDropEffects.Copy : DragDropEffects.None;
+        e.Handled = true;
+    }
+
+    private async void Window_Drop(object sender, DragEventArgs e)
+    {
+        e.Handled = true;
+        if (TryGetDroppedCwsPath(e.Data, out string? path) && path is not null)
+        {
+            await LoadDocumentFromPathAsync(path);
         }
     }
 
@@ -1844,6 +1870,27 @@ public partial class MainWindow : Window
         string fileNameWithoutExtension = Path.GetFileNameWithoutExtension(sourcePath);
         return Path.Combine(directory, $"{fileNameWithoutExtension}_edited.cws");
     }
+
+    private static bool TryGetDroppedCwsPath(IDataObject data, out string? path)
+    {
+        path = null;
+        if (!data.GetDataPresent(DataFormats.FileDrop))
+        {
+            return false;
+        }
+
+        if (data.GetData(DataFormats.FileDrop) is not string[] files)
+        {
+            return false;
+        }
+
+        path = files.FirstOrDefault(file => IsCwsPath(file) && File.Exists(file));
+        return !string.IsNullOrWhiteSpace(path);
+    }
+
+    private static bool IsCwsPath(string path) =>
+        !string.IsNullOrWhiteSpace(path) &&
+        string.Equals(Path.GetExtension(path), ".cws", StringComparison.OrdinalIgnoreCase);
 
     private static string BuildRegionSummary(EditRegion region)
     {
